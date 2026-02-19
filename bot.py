@@ -7,7 +7,8 @@ import os
 import warnings
 from datetime import datetime, timedelta, timezone
 import httpx
-from web3 import Web3
+from web3 import Web3, AsyncWeb3
+from web3.providers import AsyncHTTPProvider
 from eth_account import Account
 import secrets # For secure token generation
 import hashlib # For hashing PINs
@@ -208,12 +209,67 @@ MASTER_WALLETS = {
 # ========================================
 # Default public RPCs are provided - you can use your own for better performance
 RPC_ENDPOINTS = {
-    "ETH": "https://eth.llamarpc.com",                    # Or use Alchemy/Infura
-    "BNB": "https://bsc-dataseed.binance.org/",          # Or use NodeReal
-    "BASE": "https://mainnet.base.org",                   # Base mainnet
-    "TRON": "https://api.trongrid.io",                    # TronGrid
-    "SOLANA": "https://api.mainnet-beta.solana.com",     # Or use Helius
-    "TON": "https://toncenter.com/api/v2/jsonRPC"        # TON Center
+    "ETH": [
+        "https://eth.llamarpc.com",
+        "https://rpc.ankr.com/eth",
+        "https://cloudflare-eth.com",
+        "https://ethereum.publicnode.com",
+        "https://rpc.flashbots.net",
+        "https://eth.meowrpc.com",
+        "https://1rpc.io/eth",
+        "https://eth.drpc.org",
+        "https://api.stateless.solutions/eth-mainnet/v1/demo",
+        "https://eth-mainnet.public.blastapi.io",
+    ],
+    "BNB": [
+        "https://bsc-dataseed.binance.org/",
+        "https://bsc-dataseed1.defibit.io/",
+        "https://bsc-dataseed1.ninicoin.io/",
+        "https://bsc-dataseed2.defibit.io/",
+        "https://bsc-dataseed2.ninicoin.io/",
+        "https://bsc-dataseed3.defibit.io/",
+        "https://bsc-dataseed3.ninicoin.io/",
+        "https://bsc-dataseed4.defibit.io/",
+        "https://bsc-dataseed4.ninicoin.io/",
+        "https://binance.llamarpc.com",
+    ],
+    "BASE": [
+        "https://mainnet.base.org",
+        "https://base.llamarpc.com",
+        "https://base.publicnode.com",
+        "https://1rpc.io/base",
+        "https://base.drpc.org",
+        "https://base-mainnet.public.blastapi.io",
+        "https://base.meowrpc.com",
+        "https://rpc.notadegen.com/base",
+        "https://base.rpc.subquery.network/public",
+        "https://developer-access-mainnet.base.org",
+    ],
+    "TRON": [
+        "https://api.trongrid.io",
+        "https://api2.trongrid.io",
+        "https://rpc.ankr.com/tron_jsonrpc",
+        "https://trx.nownodes.io",
+        "https://tron-mainnet.public.blastapi.io",
+        "https://1rpc.io/trx",
+        "https://trx.drpc.org",
+        "https://api.tronstack.io",
+        "https://api.tronapi.io",
+        "https://fullnode.trongrid.io",
+    ],
+    "SOLANA": [
+        "https://api.mainnet-beta.solana.com",
+        "https://solana-mainnet.rpc.extrnode.com",
+        "https://rpc.ankr.com/solana",
+        "https://solana.publicnode.com",
+        "https://1rpc.io/sol",
+        "https://solana.drpc.org",
+        "https://solana-mainnet.public.blastapi.io",
+        "https://mainnet.helius-rpc.com/?api-key=demo",
+        "https://api.mainnet.solana.com",
+        "https://solana-rpc.publicnode.com",
+    ],
+    "TON": "https://toncenter.com/api/v2/jsonRPC",        # TON Center (single endpoint, not EVM)
 }
 
 # Token contracts (USDT/USDC on each chain)
@@ -2236,15 +2292,50 @@ class EvmService:
     
     def __init__(self, chain):
         self.chain = chain
-        self.rpc_url = RPC_ENDPOINTS[chain]
-        self.w3 = Web3(Web3.HTTPProvider(self.rpc_url))
+        self.rpc_urls = RPC_ENDPOINTS[chain]
+        self.current_rpc_index = 0
+        self.w3 = AsyncWeb3(AsyncHTTPProvider(self.rpc_urls[self.current_rpc_index]))
         self.master_wallet = MASTER_WALLETS[chain]
-    
+
+    def _rotate_rpc(self):
+        """Rotate to the next RPC endpoint."""
+        self.current_rpc_index = (self.current_rpc_index + 1) % len(self.rpc_urls)
+        self.w3 = AsyncWeb3(AsyncHTTPProvider(self.rpc_urls[self.current_rpc_index]))
+        logging.info(f"{self.chain}: switched to RPC {self.rpc_urls[self.current_rpc_index]}")
+
+    async def _execute_with_fallback(self, func, *args):
+        """Execute an async Web3 call with RPC fallback on failure."""
+        last_exc = None
+        for attempt in range(len(self.rpc_urls)):
+            try:
+                return await func(*args)
+            except Exception as e:
+                err_str = str(e).lower()
+                if any(kw in err_str for kw in ("429", "rate limit", "timeout", "connection", "network")):
+                    logging.warning(f"{self.chain} RPC error on {self.rpc_urls[self.current_rpc_index]}: {e}. Rotating RPC.")
+                    self._rotate_rpc()
+                    last_exc = e
+                else:
+                    raise
+        logging.error(f"{self.chain}: all {len(self.rpc_urls)} RPCs failed. Last error: {last_exc}")
+        return None
+
+    async def _fetch_gas_price(self):
+        return await self.w3.eth.gas_price
+
+    async def _fetch_chain_id(self):
+        return await self.w3.eth.chain_id
+
+    async def _fetch_block_number(self):
+        return await self.w3.eth.block_number
+
     async def get_balance(self, address):
         """Get native token balance"""
         try:
-            balance_wei = self.w3.eth.get_balance(address)
-            balance = self.w3.from_wei(balance_wei, 'ether')
+            balance_wei = await self._execute_with_fallback(self.w3.eth.get_balance, address)
+            if balance_wei is None:
+                return 0.0
+            balance = Web3.from_wei(balance_wei, 'ether')
             return float(balance)
         except Exception as e:
             logging.error(f"Error getting {self.chain} balance for {address}: {e}")
@@ -2263,7 +2354,11 @@ class EvmService:
                     "type": "function"
                 }]
             )
-            balance = contract.functions.balanceOf(Web3.to_checksum_address(address)).call()
+            balance = await self._execute_with_fallback(
+                contract.functions.balanceOf(Web3.to_checksum_address(address)).call
+            )
+            if balance is None:
+                return 0.0
             return balance / (10 ** decimals)
         except Exception as e:
             logging.error(f"Error getting token balance: {e}")
@@ -2280,9 +2375,11 @@ class EvmService:
                 return None
             
             # Get gas price
-            gas_price = self.w3.eth.gas_price
+            gas_price = await self._execute_with_fallback(self._fetch_gas_price)
+            if gas_price is None:
+                return None
             gas_limit = 21000
-            gas_cost = self.w3.from_wei(gas_price * gas_limit, 'ether')
+            gas_cost = Web3.from_wei(gas_price * gas_limit, 'ether')
             
             # Calculate amount to send
             if amount is None:
@@ -2293,19 +2390,25 @@ class EvmService:
                 return None
             
             # Build transaction
+            nonce = await self._execute_with_fallback(self.w3.eth.get_transaction_count, from_address)
+            chain_id = await self._execute_with_fallback(self._fetch_chain_id)
             tx = {
                 'from': Web3.to_checksum_address(from_address),
                 'to': Web3.to_checksum_address(self.master_wallet),
-                'value': self.w3.to_wei(amount, 'ether'),
+                'value': Web3.to_wei(amount, 'ether'),
                 'gas': gas_limit,
                 'gasPrice': gas_price,
-                'nonce': self.w3.eth.get_transaction_count(from_address),
-                'chainId': self.w3.eth.chain_id
+                'nonce': nonce,
+                'chainId': chain_id
             }
             
             # Sign and send
             signed = self.w3.eth.account.sign_transaction(tx, private_key)
-            tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
+            tx_hash = await self._execute_with_fallback(
+                self.w3.eth.send_raw_transaction, signed.rawTransaction
+            )
+            if tx_hash is None:
+                return None
             
             logging.info(f"Swept {amount} {self.chain} from {from_address} - TX: {tx_hash.hex()}")
             return tx_hash.hex()
@@ -2341,20 +2444,27 @@ class EvmService:
             
             # Build transaction
             amount_wei = int(balance * (10 ** decimals))
-            tx = contract.functions.transfer(
+            gas_price = await self._execute_with_fallback(self._fetch_gas_price)
+            nonce = await self._execute_with_fallback(self.w3.eth.get_transaction_count, from_address)
+            chain_id = await self._execute_with_fallback(self._fetch_chain_id)
+            tx = await contract.functions.transfer(
                 Web3.to_checksum_address(self.master_wallet),
                 amount_wei
             ).build_transaction({
                 'from': Web3.to_checksum_address(from_address),
                 'gas': 100000,
-                'gasPrice': self.w3.eth.gas_price,
-                'nonce': self.w3.eth.get_transaction_count(from_address),
-                'chainId': self.w3.eth.chain_id
+                'gasPrice': gas_price,
+                'nonce': nonce,
+                'chainId': chain_id
             })
             
             # Sign and send
             signed = self.w3.eth.account.sign_transaction(tx, private_key)
-            tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
+            tx_hash = await self._execute_with_fallback(
+                self.w3.eth.send_raw_transaction, signed.rawTransaction
+            )
+            if tx_hash is None:
+                return None
             
             logging.info(f"Swept {balance} tokens from {from_address} - TX: {tx_hash.hex()}")
             return tx_hash.hex()
@@ -2368,18 +2478,25 @@ class EvmService:
         try:
             hot_wallet = Account.from_key(HOT_WALLET_PRIVATE_KEY)
             
+            gas_price = await self._execute_with_fallback(self._fetch_gas_price)
+            nonce = await self._execute_with_fallback(self.w3.eth.get_transaction_count, hot_wallet.address)
+            chain_id = await self._execute_with_fallback(self._fetch_chain_id)
             tx = {
                 'from': hot_wallet.address,
                 'to': Web3.to_checksum_address(to_address),
-                'value': self.w3.to_wei(amount, 'ether'),
+                'value': Web3.to_wei(amount, 'ether'),
                 'gas': 21000,
-                'gasPrice': self.w3.eth.gas_price,
-                'nonce': self.w3.eth.get_transaction_count(hot_wallet.address),
-                'chainId': self.w3.eth.chain_id
+                'gasPrice': gas_price,
+                'nonce': nonce,
+                'chainId': chain_id
             }
             
             signed = self.w3.eth.account.sign_transaction(tx, HOT_WALLET_PRIVATE_KEY)
-            tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
+            tx_hash = await self._execute_with_fallback(
+                self.w3.eth.send_raw_transaction, signed.rawTransaction
+            )
+            if tx_hash is None:
+                return None
             
             logging.info(f"Funded {to_address} with {amount} {self.chain} - TX: {tx_hash.hex()}")
             return tx_hash.hex()
@@ -2391,7 +2508,9 @@ class EvmService:
     async def scan_address(self, address, last_block=None):
         """Scan address for new transactions using getLogs (event-based, more efficient)"""
         try:
-            current_block = self.w3.eth.block_number
+            current_block = await self._execute_with_fallback(self._fetch_block_number)
+            if current_block is None:
+                return [], None
             
             # Limit scan range to prevent timeout (max 1000 blocks)
             start_block = last_block + 1 if last_block else max(0, current_block - 100)
@@ -2429,12 +2548,17 @@ class EvmService:
             # Pad address to 32-byte topic (left-pad with zeros)
             padded_address = "0x" + address.lower().replace("0x", "").zfill(64)
 
-            logs = self.w3.eth.get_logs({
-                'fromBlock': from_block,
-                'toBlock': to_block,
-                'address': Web3.to_checksum_address(token_contract),
-                'topics': [TRANSFER_TOPIC, None, padded_address]
-            })
+            logs = await self._execute_with_fallback(
+                self.w3.eth.get_logs,
+                {
+                    'fromBlock': from_block,
+                    'toBlock': to_block,
+                    'address': Web3.to_checksum_address(token_contract),
+                    'topics': [TRANSFER_TOPIC, None, padded_address]
+                }
+            )
+            if logs is None:
+                return []
 
             transfers = []
             for log in logs:
@@ -2452,12 +2576,8 @@ class EvmService:
             return []
 
     async def wait_for_receipt(self, tx_hash, timeout=120):
-        """Wait for a transaction to be mined, running the blocking call in an executor"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None,
-            lambda: self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
-        )
+        """Wait for a transaction to be mined"""
+        return await self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
 
 
 class TronService:
@@ -2467,13 +2587,39 @@ class TronService:
         if not TRON_AVAILABLE:
             raise ImportError("TRON library not available")
         self.chain = "TRON"
-        self.tron = Tron(network='mainnet')
+        self.rpc_urls = RPC_ENDPOINTS['TRON']
+        self.current_rpc_index = 0
+        self.tron = Tron(full_node=self.rpc_urls[self.current_rpc_index])
         self.master_wallet = MASTER_WALLETS['TRON']
-    
+
+    def _rotate_rpc(self):
+        """Rotate to the next TRON RPC endpoint."""
+        self.current_rpc_index = (self.current_rpc_index + 1) % len(self.rpc_urls)
+        self.tron = Tron(full_node=self.rpc_urls[self.current_rpc_index])
+        logging.info(f"TRON: switched to RPC {self.rpc_urls[self.current_rpc_index]}")
+
+    async def _execute_with_fallback(self, func, *args):
+        """Execute a synchronous tronpy call in an executor with RPC fallback."""
+        loop = asyncio.get_event_loop()
+        last_exc = None
+        for attempt in range(len(self.rpc_urls)):
+            try:
+                return await loop.run_in_executor(None, func, *args)
+            except Exception as e:
+                err_str = str(e).lower()
+                if any(kw in err_str for kw in ("429", "rate limit", "timeout", "connection", "network")):
+                    logging.warning(f"TRON RPC error on {self.rpc_urls[self.current_rpc_index]}: {e}. Rotating RPC.")
+                    self._rotate_rpc()
+                    last_exc = e
+                else:
+                    raise
+        logging.error(f"TRON: all {len(self.rpc_urls)} RPCs failed. Last error: {last_exc}")
+        return None
+
     async def get_balance(self, address):
         """Get TRX balance"""
         try:
-            balance = self.tron.get_account_balance(address)
+            balance = await self._execute_with_fallback(self.tron.get_account_balance, address)
             return balance if balance else 0.0
         except Exception as e:
             logging.error(f"Error getting TRON balance: {e}")
@@ -2482,10 +2628,13 @@ class TronService:
     async def get_token_balance(self, address, token_contract):
         """Get TRC20 token balance"""
         try:
-            contract = self.tron.get_contract(token_contract)
-            balance = contract.functions.balanceOf(address)
-            decimals = contract.functions.decimals()
-            return balance / (10 ** decimals)
+            def _get_token_bal():
+                contract = self.tron.get_contract(token_contract)
+                balance = contract.functions.balanceOf(address)
+                decimals = contract.functions.decimals()
+                return balance / (10 ** decimals)
+            result = await self._execute_with_fallback(_get_token_bal)
+            return result if result is not None else 0.0
         except Exception as e:
             logging.error(f"Error getting TRON token balance: {e}")
             return 0.0
@@ -2501,16 +2650,19 @@ class TronService:
             
             # Reserve some TRX for fees
             amount = balance - 1.1
+            master_wallet = self.master_wallet
+
+            def _do_sweep():
+                tx = (
+                    self.tron.trx.transfer(from_address, master_wallet, int(amount * 1_000_000))
+                    .build()
+                    .sign(priv_key)
+                )
+                return tx.broadcast()
+
+            result = await self._execute_with_fallback(_do_sweep)
             
-            tx = (
-                self.tron.trx.transfer(from_address, self.master_wallet, int(amount * 1_000_000))
-                .build()
-                .sign(priv_key)
-            )
-            
-            result = tx.broadcast()
-            
-            if result.get('result'):
+            if result and result.get('result'):
                 tx_hash = result.get('txid')
                 logging.info(f"Swept {amount} TRX from {from_address} - TX: {tx_hash}")
                 return tx_hash
@@ -2524,26 +2676,28 @@ class TronService:
         """Sweep TRC20 tokens to master wallet"""
         try:
             priv_key = TronPrivateKey(bytes.fromhex(private_key))
-            contract = self.tron.get_contract(token_contract)
-            
             balance = await self.get_token_balance(from_address, token_contract)
             if balance == 0:
                 return None
             
-            decimals = contract.functions.decimals()
-            amount = int(balance * (10 ** decimals))
+            master_wallet = self.master_wallet
+
+            def _do_token_sweep():
+                contract = self.tron.get_contract(token_contract)
+                decimals = contract.functions.decimals()
+                amount = int(balance * (10 ** decimals))
+                tx = (
+                    contract.functions.transfer(master_wallet, amount)
+                    .with_owner(from_address)
+                    .fee_limit(50_000_000)
+                    .build()
+                    .sign(priv_key)
+                )
+                return tx.broadcast()
+
+            result = await self._execute_with_fallback(_do_token_sweep)
             
-            tx = (
-                contract.functions.transfer(self.master_wallet, amount)
-                .with_owner(from_address)
-                .fee_limit(50_000_000)
-                .build()
-                .sign(priv_key)
-            )
-            
-            result = tx.broadcast()
-            
-            if result.get('result'):
+            if result and result.get('result'):
                 tx_hash = result.get('txid')
                 logging.info(f"Swept {balance} tokens from {from_address} - TX: {tx_hash}")
                 return tx_hash
@@ -2558,16 +2712,18 @@ class TronService:
         try:
             hot_priv_key = TronPrivateKey(bytes.fromhex(HOT_WALLET_PRIVATE_KEY.replace('0x', '')))
             hot_address = hot_priv_key.public_key.to_base58check_address()
+
+            def _do_fund():
+                tx = (
+                    self.tron.trx.transfer(hot_address, to_address, int(amount * 1_000_000))
+                    .build()
+                    .sign(hot_priv_key)
+                )
+                return tx.broadcast()
+
+            result = await self._execute_with_fallback(_do_fund)
             
-            tx = (
-                self.tron.trx.transfer(hot_address, to_address, int(amount * 1_000_000))
-                .build()
-                .sign(hot_priv_key)
-            )
-            
-            result = tx.broadcast()
-            
-            if result.get('result'):
+            if result and result.get('result'):
                 return result.get('txid')
             return None
             
@@ -2583,18 +2739,43 @@ class SolanaService:
         if not SOLANA_AVAILABLE:
             raise ImportError("Solana library not available")
         self.chain = "SOLANA"
-        self.rpc_url = RPC_ENDPOINTS['SOLANA']
+        self.rpc_urls = RPC_ENDPOINTS['SOLANA']
+        self.current_rpc_index = 0
         self.master_wallet = MASTER_WALLETS['SOLANA']
-    
+
+    def _rotate_rpc(self):
+        """Rotate to the next Solana RPC endpoint."""
+        self.current_rpc_index = (self.current_rpc_index + 1) % len(self.rpc_urls)
+        logging.info(f"SOLANA: switched to RPC {self.rpc_urls[self.current_rpc_index]}")
+
+    async def _execute_with_fallback(self, coro_func, *args):
+        """Execute an async Solana client call with RPC fallback."""
+        last_exc = None
+        for attempt in range(len(self.rpc_urls)):
+            rpc_url = self.rpc_urls[self.current_rpc_index]
+            try:
+                async with SolanaClient(rpc_url) as client:
+                    return await coro_func(client, *args)
+            except Exception as e:
+                err_str = str(e).lower()
+                if any(kw in err_str for kw in ("429", "rate limit", "timeout", "connection", "network")):
+                    logging.warning(f"SOLANA RPC error on {rpc_url}: {e}. Rotating RPC.")
+                    self._rotate_rpc()
+                    last_exc = e
+                else:
+                    raise
+        logging.error(f"SOLANA: all {len(self.rpc_urls)} RPCs failed. Last error: {last_exc}")
+        return None
+
     async def get_balance(self, address):
         """Get SOL balance"""
         try:
-            async with SolanaClient(self.rpc_url) as client:
-                pubkey = SoldersPubkey.from_string(address)
+            pubkey = SoldersPubkey.from_string(address)
+            async def _get(client):
                 response = await client.get_balance(pubkey)
-                if response.value:
-                    return response.value / 1e9  # Convert lamports to SOL
-                return 0.0
+                return response.value / 1e9 if response.value else 0.0
+            result = await self._execute_with_fallback(_get)
+            return result if result is not None else 0.0
         except Exception as e:
             logging.error(f"Error getting Solana balance: {e}")
             return 0.0
@@ -2602,15 +2783,14 @@ class SolanaService:
     async def get_token_balance(self, address, mint_address):
         """Get SPL token balance"""
         try:
-            async with SolanaClient(self.rpc_url) as client:
-                pubkey = SoldersPubkey.from_string(address)
+            pubkey = SoldersPubkey.from_string(address)
+            mint_pubkey = SoldersPubkey.from_string(mint_address)
+            async def _get(client):
                 response = await client.get_token_accounts_by_owner(
                     pubkey,
-                    {"mint": SoldersPubkey.from_string(mint_address)}
+                    {"mint": mint_pubkey}
                 )
-                
                 if response.value:
-                    # Parse token account data
                     import struct
                     for account in response.value:
                         data = account.account.data
@@ -2619,6 +2799,8 @@ class SolanaService:
                         decimals = TOKEN_CONTRACTS['SOLANA'].get('USDT', {}).get('decimals', 6)
                         return amount / (10 ** decimals)
                 return 0.0
+            result = await self._execute_with_fallback(_get)
+            return result if result is not None else 0.0
         except Exception as e:
             logging.error(f"Error getting Solana token balance: {e}")
             return 0.0
@@ -2626,43 +2808,33 @@ class SolanaService:
     async def sweep(self, from_address, private_key_bytes):
         """Sweep SOL to master wallet"""
         try:
-            async with SolanaClient(self.rpc_url) as client:
-                # Create keypair from private key bytes
-                from_keypair = SoldersKeypair.from_bytes(private_key_bytes)
-                
-                # Get balance
+            from_keypair = SoldersKeypair.from_bytes(private_key_bytes)
+            master_wallet = self.master_wallet
+
+            async def _do_sweep(client):
                 balance_response = await client.get_balance(from_keypair.pubkey())
                 balance_lamports = balance_response.value
-                
-                # Reserve for fees (5000 lamports)
                 if balance_lamports < 10000:
                     return None
-                
                 amount = balance_lamports - 5000
-                
-                # Create transfer instruction
                 transfer_ix = solders_transfer(
                     SoldersTransferParams(
                         from_pubkey=from_keypair.pubkey(),
-                        to_pubkey=SoldersPubkey.from_string(self.master_wallet),
+                        to_pubkey=SoldersPubkey.from_string(master_wallet),
                         lamports=amount
                     )
                 )
-                
-                # Get recent blockhash
                 blockhash_response = await client.get_latest_blockhash()
                 recent_blockhash = blockhash_response.value.blockhash
-                
-                # Create and sign transaction
                 tx = SoldersTransaction.new_with_payer([transfer_ix], from_keypair.pubkey())
                 tx.partial_sign([from_keypair], recent_blockhash)
-                
-                # Send transaction
                 result = await client.send_transaction(tx)
-                tx_hash = str(result.value)
-                
-                logging.info(f"Swept {amount/1e9} SOL from {from_address} - TX: {tx_hash}")
-                return tx_hash
+                return str(result.value)
+
+            tx_hash = await self._execute_with_fallback(_do_sweep)
+            if tx_hash:
+                logging.info(f"Swept SOL from {from_address} - TX: {tx_hash}")
+            return tx_hash
                 
         except Exception as e:
             logging.error(f"Error sweeping Solana: {e}")
@@ -2671,17 +2843,13 @@ class SolanaService:
     async def fund_gas(self, to_address, amount=0.001):
         """Fund address with SOL for fees"""
         try:
-            async with SolanaClient(self.rpc_url) as client:
-                # Create hot wallet keypair from private key
-                hot_priv_bytes = bytes.fromhex(HOT_WALLET_PRIVATE_KEY.replace('0x', ''))
-                # Pad to 64 bytes if needed (32 private + 32 public)
-                if len(hot_priv_bytes) == 32:
-                    # Need to derive the full keypair
-                    hot_keypair = SoldersKeypair.from_seed(hot_priv_bytes)
-                else:
-                    hot_keypair = SoldersKeypair.from_bytes(hot_priv_bytes)
-                
-                # Create transfer
+            hot_priv_bytes = bytes.fromhex(HOT_WALLET_PRIVATE_KEY.replace('0x', ''))
+            if len(hot_priv_bytes) == 32:
+                hot_keypair = SoldersKeypair.from_seed(hot_priv_bytes)
+            else:
+                hot_keypair = SoldersKeypair.from_bytes(hot_priv_bytes)
+
+            async def _do_fund(client):
                 transfer_ix = solders_transfer(
                     SoldersTransferParams(
                         from_pubkey=hot_keypair.pubkey(),
@@ -2689,16 +2857,14 @@ class SolanaService:
                         lamports=int(amount * 1e9)
                     )
                 )
-                
                 blockhash_response = await client.get_latest_blockhash()
                 recent_blockhash = blockhash_response.value.blockhash
-                
                 tx = SoldersTransaction.new_with_payer([transfer_ix], hot_keypair.pubkey())
                 tx.partial_sign([hot_keypair], recent_blockhash)
-                
                 result = await client.send_transaction(tx)
-                
                 return str(result.value)
+
+            return await self._execute_with_fallback(_do_fund)
                 
         except Exception as e:
             logging.error(f"Error funding Solana gas: {e}")
@@ -2812,6 +2978,8 @@ class BlockMonitor:
                         await self._scan_address(chain, address, user_id, telegram_id)
                         # Add small delay to prevent rate limiting
                         await asyncio.sleep(0.1)
+                # Throttle between users to preserve RPC compute units
+                await asyncio.sleep(0.5)
             
         except Exception as e:
             logging.error(f"Error in scan_all_addresses: {e}")
