@@ -1839,8 +1839,7 @@ class DepositDatabase:
 
         # Migration: Add gas/sweep accounting columns (prevent gas-funding exploit)
         for col, definition in [
-            ("total_gas_funded", "REAL DEFAULT 0.0"),
-            ("total_native_swept", "REAL DEFAULT 0.0"),
+            ("last_native_balance", "REAL DEFAULT 0.0"),
         ]:
             try:
                 cursor.execute(f"SELECT {col} FROM user_addresses LIMIT 1")
@@ -2396,68 +2395,75 @@ class DepositDatabase:
         'TON': 'ton_address',
     }
 
-    async def async_add_gas_funded(self, address: str, chain: str, amount: float):
-        """Record gas funded to a deposit address (prevents gas-funding false deposits)."""
+    async def async_get_last_native_balance(self, address: str, chain: str) -> float:
+        """Return the stored baseline native balance for an address (baseline tracking model)."""
         col = self._CHAIN_ADDRESS_COL.get(chain)
         if not col:
-            return
-        try:
-            async with aiosqlite.connect(self.db_path) as db:
-                await db.execute(
-                    f"UPDATE user_addresses SET total_gas_funded = COALESCE(total_gas_funded, 0) + ? WHERE {col} = ?",
-                    (amount, address)
-                )
-                await db.commit()
-        except Exception as e:
-            logging.error(f"async_add_gas_funded error: {e}")
-
-    async def async_add_native_swept(self, address: str, chain: str, amount: float):
-        """Record amount of native coin swept from a deposit address."""
-        col = self._CHAIN_ADDRESS_COL.get(chain)
-        if not col:
-            return
-        try:
-            async with aiosqlite.connect(self.db_path) as db:
-                await db.execute(
-                    f"UPDATE user_addresses SET total_native_swept = COALESCE(total_native_swept, 0) + ? WHERE {col} = ?",
-                    (amount, address)
-                )
-                await db.commit()
-        except Exception as e:
-            logging.error(f"async_add_native_swept error: {e}")
-
-    async def async_get_gas_and_swept(self, address: str, chain: str) -> tuple:
-        """Return (total_gas_funded, total_native_swept) for an address."""
-        col = self._CHAIN_ADDRESS_COL.get(chain)
-        if not col:
-            return 0.0, 0.0
+            return 0.0
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 cursor = await db.execute(
-                    f"SELECT COALESCE(total_gas_funded, 0), COALESCE(total_native_swept, 0) "
-                    f"FROM user_addresses WHERE {col} = ?",
+                    f"SELECT COALESCE(last_native_balance, 0) FROM user_addresses WHERE {col} = ?",
                     (address,)
-                )
-                row = await cursor.fetchone()
-                return (float(row[0]), float(row[1])) if row else (0.0, 0.0)
-        except Exception as e:
-            logging.error(f"async_get_gas_and_swept error: {e}")
-            return 0.0, 0.0
-
-    async def async_get_lifetime_native_deposits(self, user_id: int, chain: str, address: str) -> float:
-        """Return sum of ALL native deposits ever recorded for a user/chain/address."""
-        try:
-            async with aiosqlite.connect(self.db_path) as db:
-                cursor = await db.execute(
-                    "SELECT COALESCE(SUM(amount), 0) FROM deposits "
-                    "WHERE user_id = ? AND chain = ? AND to_address = ? AND token IS NULL",
-                    (user_id, chain, address)
                 )
                 row = await cursor.fetchone()
                 return float(row[0]) if row else 0.0
         except Exception as e:
-            logging.error(f"async_get_lifetime_native_deposits error: {e}")
+            logging.error(f"async_get_last_native_balance error: {e}")
             return 0.0
+
+    async def async_update_last_native_balance(self, address: str, chain: str, new_balance: float):
+        """Persist the new baseline native balance for an address."""
+        col = self._CHAIN_ADDRESS_COL.get(chain)
+        if not col:
+            return
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    f"UPDATE user_addresses SET last_native_balance = ? WHERE {col} = ?",
+                    (new_balance, address)
+                )
+                await db.commit()
+        except Exception as e:
+            logging.error(f"async_update_last_native_balance error: {e}")
+
+    async def async_increment_last_native_balance(self, address: str, chain: str, delta: float):
+        """Atomically add *delta* to last_native_balance (used after gas funding)."""
+        col = self._CHAIN_ADDRESS_COL.get(chain)
+        if not col:
+            return
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    f"UPDATE user_addresses "
+                    f"SET last_native_balance = COALESCE(last_native_balance, 0) + ? "
+                    f"WHERE {col} = ?",
+                    (delta, address)
+                )
+                await db.commit()
+        except Exception as e:
+            logging.error(f"async_increment_last_native_balance error: {e}")
+
+    async def async_lower_last_native_balance_if_less(self, address: str, chain: str, candidate: float):
+        """Atomically set last_native_balance = candidate only if candidate < current value.
+
+        Used after a sweep confirms to reflect the post-sweep on-chain balance without
+        overwriting a higher baseline that may have been written by a concurrent deposit.
+        """
+        col = self._CHAIN_ADDRESS_COL.get(chain)
+        if not col:
+            return
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    f"UPDATE user_addresses "
+                    f"SET last_native_balance = ? "
+                    f"WHERE {col} = ? AND COALESCE(last_native_balance, 0) > ?",
+                    (candidate, address, candidate)
+                )
+                await db.commit()
+        except Exception as e:
+            logging.error(f"async_lower_last_native_balance_if_less error: {e}")
 
     async def async_get_user_deposits(self, telegram_id: int, limit: int = 10):
         """Async version of get_user_deposits using aiosqlite."""
@@ -3370,18 +3376,16 @@ class BlockMonitor:
             # Ensure the user's data is in memory (may be missing after a bot restart)
             load_user_data_if_missing(telegram_id)
 
-            # ── Native balance delta (expected-balance model) ───────────────
-            # We compute what the balance *should* be based on all recorded
-            # lifetime deposits, gas funded in, and native coin swept out.
-            # This avoids crediting the user when AutoSweeper funds gas or
-            # when sweep dust is left behind.
+            # ── Native balance delta (baseline tracking model) ──────────────
+            # Compare current on-chain balance against the stored baseline.
+            # The baseline is updated every time a new deposit is credited or
+            # after a sweep confirms, so gas fees and sweep dust are handled
+            # correctly without under-crediting the user.
             balance = await service.get_balance(address)
 
-            lifetime_native_deposits = await self.db.async_get_lifetime_native_deposits(user_id, chain, address)
-            total_gas_funded, total_native_swept = await self.db.async_get_gas_and_swept(address, chain)
-            expected_balance = lifetime_native_deposits + total_gas_funded - total_native_swept
-            new_native_amount = balance - expected_balance
-            if new_native_amount > 0.0001:  # Minimum threshold
+            last_native_balance = await self.db.async_get_last_native_balance(address, chain)
+            new_native_amount = balance - last_native_balance
+            if new_native_amount > 0.0001:  # Minimum threshold (native units)
                 symbol = NATIVE_SYMBOLS.get(chain, chain)
                 price_usd = await get_crypto_price_usd(symbol)
                 amount_usd = new_native_amount * price_usd
@@ -3398,6 +3402,8 @@ class BlockMonitor:
 
                 if deposit_id:
                     found_deposit = True
+                    # Advance baseline to current balance now that the deposit is recorded
+                    await self.db.async_update_last_native_balance(address, chain, balance)
                     logging.info(f"New native deposit: {new_native_amount} {symbol} for user {telegram_id} (${amount_usd:.2f})")
                     required_confs = CONFIRMATIONS.get(chain, 10)
                     await self.db.async_update_deposit_status(tx_hash, 'confirmed', confirmations=required_confs)
@@ -3698,8 +3704,9 @@ class AutoSweeper:
                     gas_tx = await service.fund_gas(from_address, gas_needed)
                     
                     if gas_tx:
-                        # Record gas funded so BlockMonitor doesn't credit it as a deposit
-                        await self.db.async_add_gas_funded(from_address, chain, gas_needed)
+                        # Atomically raise baseline by gas_needed so BlockMonitor
+                        # doesn't credit the incoming gas as a user deposit.
+                        await self.db.async_increment_last_native_balance(from_address, chain, gas_needed)
                         # Wait for the gas transaction to be mined before sweeping tokens
                         if hasattr(service, 'wait_for_receipt'):
                             try:
@@ -3731,24 +3738,47 @@ class AutoSweeper:
                 else:
                     decimals = TOKEN_CONTRACTS[chain][token]['decimals']
                     sweep_tx_hash = await service.sweep_token(from_address, private_key, token_contract, decimals)
+                
+                if sweep_tx_hash:
+                    await self.db.async_update_deposit_status_swept(
+                        deposit_tx_hash,
+                        sweep_tx_hash=sweep_tx_hash,
+                        swept_at=datetime.now().isoformat()
+                    )
+                    logging.info(f"Successfully swept token deposit {deposit_tx_hash} - Sweep TX: {sweep_tx_hash}")
+                    # Wait for confirmation then lower baseline if balance dropped
+                    if hasattr(service, 'wait_for_receipt'):
+                        try:
+                            await service.wait_for_receipt(sweep_tx_hash, timeout=120)
+                        except Exception:
+                            pass
+                    else:
+                        await asyncio.sleep(15)
+                    post_sweep_balance = await service.get_balance(from_address)
+                    await self.db.async_lower_last_native_balance_if_less(from_address, chain, post_sweep_balance)
             
             else:
-                # Native token sweep — record pre-sweep balance before executing
+                # Native token sweep
                 logging.info(f"Sweeping native {chain} from {from_address}")
-                pre_sweep_balance = await service.get_balance(from_address)
                 sweep_tx_hash = await service.sweep(from_address, private_key)
+                
                 if sweep_tx_hash:
-                    # Record how much native coin was swept so BlockMonitor stays accurate
-                    await self.db.async_add_native_swept(from_address, chain, pre_sweep_balance)
-            
-            if sweep_tx_hash:
-                # Update database asynchronously
-                await self.db.async_update_deposit_status_swept(
-                    deposit_tx_hash,
-                    sweep_tx_hash=sweep_tx_hash,
-                    swept_at=datetime.now().isoformat()
-                )
-                logging.info(f"Successfully swept deposit {deposit_tx_hash} - Sweep TX: {sweep_tx_hash}")
+                    await self.db.async_update_deposit_status_swept(
+                        deposit_tx_hash,
+                        sweep_tx_hash=sweep_tx_hash,
+                        swept_at=datetime.now().isoformat()
+                    )
+                    logging.info(f"Successfully swept native deposit {deposit_tx_hash} - Sweep TX: {sweep_tx_hash}")
+                    # Wait for confirmation then atomically lower baseline if post-sweep < current
+                    if hasattr(service, 'wait_for_receipt'):
+                        try:
+                            await service.wait_for_receipt(sweep_tx_hash, timeout=120)
+                        except Exception:
+                            pass
+                    else:
+                        await asyncio.sleep(15)
+                    post_sweep_balance = await service.get_balance(from_address)
+                    await self.db.async_lower_last_native_balance_if_less(from_address, chain, post_sweep_balance)
             
         except Exception as e:
             logging.error(f"Error in _sweep_deposit: {e}")
