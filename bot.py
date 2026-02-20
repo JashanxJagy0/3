@@ -1836,6 +1836,18 @@ class DepositDatabase:
             logging.info("Adding ton_private_key column to user_addresses table")
             cursor.execute("ALTER TABLE user_addresses ADD COLUMN ton_private_key TEXT")
             conn.commit()
+
+        # Migration: Add gas/sweep accounting columns (prevent gas-funding exploit)
+        for col, definition in [
+            ("total_gas_funded", "REAL DEFAULT 0.0"),
+            ("total_native_swept", "REAL DEFAULT 0.0"),
+        ]:
+            try:
+                cursor.execute(f"SELECT {col} FROM user_addresses LIMIT 1")
+            except sqlite3.OperationalError:
+                logging.info(f"Adding {col} column to user_addresses table")
+                cursor.execute(f"ALTER TABLE user_addresses ADD COLUMN {col} {definition}")
+                conn.commit()
         
         # Deposits table
         cursor.execute('''
@@ -2372,6 +2384,98 @@ class DepositDatabase:
                 await db.commit()
         except Exception as e:
             logging.error(f"async_update_deposit_status_swept error: {e}")
+
+    # Whitelist mapping chain name → user_addresses column for that chain's deposit address.
+    # Used to build safe SQL WHERE clauses without f-string injection risk.
+    _CHAIN_ADDRESS_COL: dict = {
+        'ETH': 'eth_address',
+        'BNB': 'bnb_address',
+        'BASE': 'base_address',
+        'TRON': 'tron_address',
+        'SOLANA': 'solana_address',
+        'TON': 'ton_address',
+    }
+
+    async def async_add_gas_funded(self, address: str, chain: str, amount: float):
+        """Record gas funded to a deposit address (prevents gas-funding false deposits)."""
+        col = self._CHAIN_ADDRESS_COL.get(chain)
+        if not col:
+            return
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    f"UPDATE user_addresses SET total_gas_funded = COALESCE(total_gas_funded, 0) + ? WHERE {col} = ?",
+                    (amount, address)
+                )
+                await db.commit()
+        except Exception as e:
+            logging.error(f"async_add_gas_funded error: {e}")
+
+    async def async_add_native_swept(self, address: str, chain: str, amount: float):
+        """Record amount of native coin swept from a deposit address."""
+        col = self._CHAIN_ADDRESS_COL.get(chain)
+        if not col:
+            return
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    f"UPDATE user_addresses SET total_native_swept = COALESCE(total_native_swept, 0) + ? WHERE {col} = ?",
+                    (amount, address)
+                )
+                await db.commit()
+        except Exception as e:
+            logging.error(f"async_add_native_swept error: {e}")
+
+    async def async_get_gas_and_swept(self, address: str, chain: str) -> tuple:
+        """Return (total_gas_funded, total_native_swept) for an address."""
+        col = self._CHAIN_ADDRESS_COL.get(chain)
+        if not col:
+            return 0.0, 0.0
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    f"SELECT COALESCE(total_gas_funded, 0), COALESCE(total_native_swept, 0) "
+                    f"FROM user_addresses WHERE {col} = ?",
+                    (address,)
+                )
+                row = await cursor.fetchone()
+                return (float(row[0]), float(row[1])) if row else (0.0, 0.0)
+        except Exception as e:
+            logging.error(f"async_get_gas_and_swept error: {e}")
+            return 0.0, 0.0
+
+    async def async_get_lifetime_native_deposits(self, user_id: int, chain: str, address: str) -> float:
+        """Return sum of ALL native deposits ever recorded for a user/chain/address."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    "SELECT COALESCE(SUM(amount), 0) FROM deposits "
+                    "WHERE user_id = ? AND chain = ? AND to_address = ? AND token IS NULL",
+                    (user_id, chain, address)
+                )
+                row = await cursor.fetchone()
+                return float(row[0]) if row else 0.0
+        except Exception as e:
+            logging.error(f"async_get_lifetime_native_deposits error: {e}")
+            return 0.0
+
+    async def async_get_user_deposits(self, telegram_id: int, limit: int = 10):
+        """Async version of get_user_deposits using aiosqlite."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute('''
+                    SELECT d.tx_hash, d.chain, d.token, d.amount, d.amount_usd,
+                           d.status, d.created_at, d.confirmed_at
+                    FROM deposits d
+                    JOIN user_addresses u ON d.user_id = u.user_id
+                    WHERE u.telegram_id = ?
+                    ORDER BY d.created_at DESC
+                    LIMIT ?
+                ''', (telegram_id, limit))
+                return await cursor.fetchall()
+        except Exception as e:
+            logging.error(f"async_get_user_deposits error: {e}")
+            return []
 
 
 class OxaPayService:
@@ -3266,12 +3370,17 @@ class BlockMonitor:
             # Ensure the user's data is in memory (may be missing after a bot restart)
             load_user_data_if_missing(telegram_id)
 
-            # ── Native balance delta ─────────────────────────────────────────
+            # ── Native balance delta (expected-balance model) ───────────────
+            # We compute what the balance *should* be based on all recorded
+            # lifetime deposits, gas funded in, and native coin swept out.
+            # This avoids crediting the user when AutoSweeper funds gas or
+            # when sweep dust is left behind.
             balance = await service.get_balance(address)
 
-            recorded_unswept = await self.db.async_get_recorded_unswept(user_id, chain, address)
-
-            new_native_amount = balance - recorded_unswept
+            lifetime_native_deposits = await self.db.async_get_lifetime_native_deposits(user_id, chain, address)
+            total_gas_funded, total_native_swept = await self.db.async_get_gas_and_swept(address, chain)
+            expected_balance = lifetime_native_deposits + total_gas_funded - total_native_swept
+            new_native_amount = balance - expected_balance
             if new_native_amount > 0.0001:  # Minimum threshold
                 symbol = NATIVE_SYMBOLS.get(chain, chain)
                 price_usd = await get_crypto_price_usd(symbol)
@@ -3589,6 +3698,8 @@ class AutoSweeper:
                     gas_tx = await service.fund_gas(from_address, gas_needed)
                     
                     if gas_tx:
+                        # Record gas funded so BlockMonitor doesn't credit it as a deposit
+                        await self.db.async_add_gas_funded(from_address, chain, gas_needed)
                         # Wait for the gas transaction to be mined before sweeping tokens
                         if hasattr(service, 'wait_for_receipt'):
                             try:
@@ -3622,13 +3733,13 @@ class AutoSweeper:
                     sweep_tx_hash = await service.sweep_token(from_address, private_key, token_contract, decimals)
             
             else:
-                # Native token sweep
+                # Native token sweep — record pre-sweep balance before executing
                 logging.info(f"Sweeping native {chain} from {from_address}")
-                
-                if chain == 'SOLANA':
-                    sweep_tx_hash = await service.sweep(from_address, private_key)
-                else:
-                    sweep_tx_hash = await service.sweep(from_address, private_key)
+                pre_sweep_balance = await service.get_balance(from_address)
+                sweep_tx_hash = await service.sweep(from_address, private_key)
+                if sweep_tx_hash:
+                    # Record how much native coin was swept so BlockMonitor stays accurate
+                    await self.db.async_add_native_swept(from_address, chain, pre_sweep_balance)
             
             if sweep_tx_hash:
                 # Update database asynchronously
@@ -3644,6 +3755,10 @@ class AutoSweeper:
 
 
 # ===== DEPOSIT COMMAND HANDLERS =====
+
+# Single shared DepositDatabase instance — avoids re-running init_db() on every
+# button click and prevents repeated synchronous SQLite initialization.
+global_deposit_db = DepositDatabase()
 
 def build_deposit_menu():
     """Build deposit menu dynamically based on available chains"""
@@ -3742,7 +3857,7 @@ async def deposit_method_callback(update: Update, context: ContextTypes.DEFAULT_
     chain = query.data.replace("deposit_", "")
     
     # Get or create user addresses
-    db = DepositDatabase()
+    db = global_deposit_db
     user_data = await db.async_get_or_create_user(user_id)
     
     # Get address for selected chain
@@ -3848,7 +3963,7 @@ async def check_deposit_status(update: Update, context: ContextTypes.DEFAULT_TYP
                 await query.answer("This button is not for you!", show_alert=True)
                 return
     
-    db = DepositDatabase()
+    db = global_deposit_db
     
     # If checking a specific chain, register the user for 3-minute on-demand scanning
     if chain_to_check:
@@ -3864,8 +3979,8 @@ async def check_deposit_status(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception as e:
             logging.error(f"Error registering scan: {e}")
     
-    # Get deposit history
-    deposits = db.get_user_deposits(user_id, limit=5)
+    # Get deposit history (async to avoid blocking the event loop)
+    deposits = await global_deposit_db.async_get_user_deposits(user_id, limit=5)
     
     # Chain name mapping for display
     chain_names = {
@@ -4110,7 +4225,7 @@ async def start_oxapay_webhook_server():
 async def active_scans_monitor_task(application):
     """Background task: every 15 s scan addresses registered via 'Check Status' button.
     When a deposit is found, notify the user via DM and remove them from the scan list."""
-    db = DepositDatabase()
+    db = global_deposit_db
     monitor = BlockMonitor(db)
 
     while not bot_stopped:
@@ -4143,7 +4258,7 @@ async def active_scans_monitor_task(application):
 
 async def sweep_deposits_task(application):
     """Background task to sweep deposits"""
-    db = DepositDatabase()
+    db = global_deposit_db
     sweeper = AutoSweeper(db)
     
     while not bot_stopped:
@@ -13436,7 +13551,7 @@ async def rain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Create rain in DB
     rain_id = str(uuid.uuid4())
     end_time = (datetime.now(timezone.utc) + timedelta(seconds=RAIN_DURATION_SECONDS)).isoformat()
-    db = DepositDatabase()
+    db = global_deposit_db
     db.create_rain(
         rain_id=rain_id,
         chat_id=update.effective_chat.id,
@@ -13477,7 +13592,7 @@ async def join_rain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user = query.from_user
     rain_id = query.data.replace("join_rain_", "", 1)
 
-    db = DepositDatabase()
+    db = global_deposit_db
     rain = db.get_rain(rain_id)
 
     if not rain:
@@ -13534,7 +13649,7 @@ async def finalize_rain_job(context: ContextTypes.DEFAULT_TYPE):
     chat_id = data['chat_id']
     message_id = data['message_id']
 
-    db = DepositDatabase()
+    db = global_deposit_db
     rain = db.get_rain(rain_id)
 
     if not rain or rain['status'] != 'active':
