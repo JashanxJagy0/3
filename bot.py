@@ -2275,6 +2275,104 @@ class DepositDatabase:
             logging.error(f"async_get_all_user_addresses error: {e}")
             return []
 
+    async def async_get_or_create_user(self, telegram_id: int) -> dict:
+        """Async version of get_or_create_user using aiosqlite.
+
+        Returns the same dict structure as the synchronous version.
+        Address generation (CPU-bound) is still done synchronously but is
+        only invoked for brand-new users so it does not block the loop
+        in steady-state operation.
+        """
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    'SELECT * FROM user_addresses WHERE telegram_id = ?', (telegram_id,)
+                )
+                user = await cursor.fetchone()
+
+                if user:
+                    return {
+                        'user_id': user['user_id'],
+                        'telegram_id': user['telegram_id'],
+                        'address_index': user['address_index'],
+                        'eth_address': user['eth_address'],
+                        'bnb_address': user['bnb_address'],
+                        'base_address': user['base_address'],
+                        'tron_address': user['tron_address'],
+                        'solana_address': user['solana_address'],
+                        'ton_address': user['ton_address'],
+                        'ton_private_key': user['ton_private_key'],
+                    }
+
+                # New user — generate addresses (sync, but only happens once per user)
+                cursor2 = await db.execute('SELECT MAX(address_index) FROM user_addresses')
+                row = await cursor2.fetchone()
+                max_index = row[0] if row and row[0] is not None else 0
+                next_index = max_index + 1
+
+                wallet_manager = HDWalletManager()
+                addresses = {}
+                ton_private_key = None
+                for chain in ['ETH', 'BNB', 'BASE', 'TRON', 'SOLANA', 'TON']:
+                    try:
+                        if chain == 'TON':
+                            ton_data = wallet_manager.generate_ton_with_key(next_index)
+                            if ton_data and isinstance(ton_data, dict) and 'address' in ton_data:
+                                addresses[chain] = ton_data['address']
+                                ton_private_key = ton_data.get('private_key')
+                            else:
+                                addresses[chain] = None
+                        else:
+                            addresses[chain] = wallet_manager.generate_address(chain, next_index)
+                    except Exception as e:
+                        logging.error(f"async_get_or_create_user: error generating {chain} address: {e}")
+                        addresses[chain] = None
+
+                await db.execute('''
+                    INSERT INTO user_addresses
+                    (telegram_id, address_index, eth_address, bnb_address, base_address,
+                     tron_address, solana_address, ton_address, ton_private_key)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (telegram_id, next_index, addresses['ETH'], addresses['BNB'],
+                      addresses['BASE'], addresses['TRON'], addresses['SOLANA'],
+                      addresses['TON'], ton_private_key))
+                await db.commit()
+
+                cursor3 = await db.execute('SELECT last_insert_rowid()')
+                row3 = await cursor3.fetchone()
+                user_id = row3[0] if row3 else next_index
+
+                logging.info(f"async_get_or_create_user: created deposit addresses for user {telegram_id} (index {next_index})")
+                return {
+                    'user_id': user_id,
+                    'telegram_id': telegram_id,
+                    'address_index': next_index,
+                    'eth_address': addresses['ETH'],
+                    'bnb_address': addresses['BNB'],
+                    'base_address': addresses['BASE'],
+                    'tron_address': addresses['TRON'],
+                    'solana_address': addresses['SOLANA'],
+                    'ton_address': addresses['TON'],
+                    'ton_private_key': ton_private_key,
+                }
+        except Exception as e:
+            logging.error(f"async_get_or_create_user error: {e}")
+            # Fallback to synchronous version
+            return self.get_or_create_user(telegram_id)
+
+    async def async_update_deposit_status_swept(self, tx_hash: str, sweep_tx_hash: str, swept_at: str):
+        """Async helper to mark a deposit as swept (used by AutoSweeper)."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    "UPDATE deposits SET status = 'swept', sweep_tx_hash = ?, swept_at = ? WHERE tx_hash = ?",
+                    (sweep_tx_hash, swept_at, tx_hash)
+                )
+                await db.commit()
+        except Exception as e:
+            logging.error(f"async_update_deposit_status_swept error: {e}")
+
 
 class OxaPayService:
     """OxaPay payment gateway integration."""
@@ -3165,6 +3263,9 @@ class BlockMonitor:
             if not service:
                 return False
 
+            # Ensure the user's data is in memory (may be missing after a bot restart)
+            load_user_data_if_missing(telegram_id)
+
             # ── Native balance delta ─────────────────────────────────────────
             balance = await service.get_balance(address)
 
@@ -3438,31 +3539,26 @@ class AutoSweeper:
             pass
     
     async def process_pending_sweeps(self):
-        """Process all confirmed deposits that need sweeping"""
+        """Process all confirmed deposits that need sweeping (fully async via aiosqlite)."""
         try:
-            # Get deposits ready for sweep
-            conn = self.db.get_connection()
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT d.id, d.tx_hash, d.chain, d.token, d.amount, d.to_address, u.address_index
-                FROM deposits d
-                JOIN user_addresses u ON d.user_id = u.user_id
-                WHERE d.status = 'confirmed' OR (d.status = 'pending' AND d.amount_usd >= ?)
-                ORDER BY d.created_at ASC
-                LIMIT 50
-            ''', (MIN_DEPOSIT_USD,))
-            
-            deposits = cursor.fetchall()
-            conn.close()
-            
+            async with aiosqlite.connect(self.db.db_path) as db:
+                cursor = await db.execute('''
+                    SELECT d.id, d.tx_hash, d.chain, d.token, d.amount, d.to_address, u.address_index
+                    FROM deposits d
+                    JOIN user_addresses u ON d.user_id = u.user_id
+                    WHERE d.status = 'confirmed' OR (d.status = 'pending' AND d.amount_usd >= ?)
+                    ORDER BY d.created_at ASC
+                    LIMIT 50
+                ''', (MIN_DEPOSIT_USD,))
+                deposits = await cursor.fetchall()
+
             for deposit in deposits:
                 dep_id, tx_hash, chain, token, amount, to_address, addr_index = deposit
-                
                 try:
                     await self._sweep_deposit(chain, token, to_address, addr_index, tx_hash)
                 except Exception as e:
                     logging.error(f"Error sweeping deposit {tx_hash}: {e}")
-            
+
         except Exception as e:
             logging.error(f"Error in process_pending_sweeps: {e}")
     
@@ -3535,10 +3631,9 @@ class AutoSweeper:
                     sweep_tx_hash = await service.sweep(from_address, private_key)
             
             if sweep_tx_hash:
-                # Update database
-                self.db.update_deposit_status(
+                # Update database asynchronously
+                await self.db.async_update_deposit_status_swept(
                     deposit_tx_hash,
-                    status='swept',
                     sweep_tx_hash=sweep_tx_hash,
                     swept_at=datetime.now().isoformat()
                 )
@@ -3648,7 +3743,7 @@ async def deposit_method_callback(update: Update, context: ContextTypes.DEFAULT_
     
     # Get or create user addresses
     db = DepositDatabase()
-    user_data = db.get_or_create_user(user_id)
+    user_data = await db.async_get_or_create_user(user_id)
     
     # Get address for selected chain
     address = user_data.get(f"{chain.lower()}_address")
@@ -3758,7 +3853,7 @@ async def check_deposit_status(update: Update, context: ContextTypes.DEFAULT_TYP
     # If checking a specific chain, register the user for 3-minute on-demand scanning
     if chain_to_check:
         try:
-            user_data = db.get_or_create_user(user_id)
+            user_data = await db.async_get_or_create_user(user_id)
             address = user_data.get(f"{chain_to_check.lower()}_address")
             
             if address:
@@ -3944,7 +4039,11 @@ async def oxapay_webhook_handler(request: aiohttp.web.Request) -> aiohttp.web.Re
         logging.info(f"OxaPay webhook received: {data}")
 
         status = data.get("status", "").lower()
-        if status not in ("paid", "confirmed"):
+        # OxaPay uses "paid" as the terminal success status for completed payments.
+        # Other statuses (e.g. "waiting", "expired", "refunded") do not represent
+        # confirmed funds and must not trigger a credit. Return "ok" immediately so
+        # OxaPay does not enter a retry loop for these events.
+        if status != "paid":
             return aiohttp.web.Response(text="ok")
 
         order_id = data.get("orderId", "")
@@ -3956,6 +4055,13 @@ async def oxapay_webhook_handler(request: aiohttp.web.Request) -> aiohttp.web.Re
         raw_pay = data.get("payAmount") if data.get("payAmount") is not None else data.get("pay_amount")
         pay_amount = float(raw_pay) if raw_pay is not None else amount_usd
 
+        # Validate: do not credit zero or negative amounts.
+        # Return "ok" so OxaPay does not retry -- a zero payAmount on a
+        # "paid" callback is a data anomaly, not a transient error.
+        if pay_amount <= 0:
+            logging.warning(f"OxaPay webhook: pay_amount is {pay_amount} for orderId {order_id}, skipping credit")
+            return aiohttp.web.Response(text="ok")
+
         # orderId format: {telegram_id}_{timestamp}
         telegram_id_str = order_id.split("_")[0] if "_" in order_id else ""
         if not telegram_id_str.isdigit():
@@ -3963,6 +4069,9 @@ async def oxapay_webhook_handler(request: aiohttp.web.Request) -> aiohttp.web.Re
             return aiohttp.web.Response(text="ok")
 
         telegram_id = int(telegram_id_str)
+
+        # Ensure user data is in memory (may be absent after bot restart)
+        load_user_data_if_missing(telegram_id)
 
         if telegram_id in user_wallets:
             # Credit the actual crypto amount (BTC→BTC, SOL→SOL, ETH→ETH, USDT→USDT, etc.)
@@ -4013,7 +4122,7 @@ async def active_scans_monitor_task(application):
 
             for (telegram_id, chain), expiry in list(active_manual_scans.items()):
                 try:
-                    user_data = db.get_or_create_user(telegram_id)
+                    user_data = await db.async_get_or_create_user(telegram_id)
                     address = user_data.get(f"{chain.lower()}_address")
                     if not address:
                         continue
@@ -4826,6 +4935,40 @@ def save_all_user_data():
     for user_id in user_stats.keys():
         save_user_data(user_id)
     logging.info("All user data saved.")
+
+def load_user_data_if_missing(user_id: int):
+    """Load a user's data from disk into memory if not already present.
+
+    Prevents silent deposit loss after bot restarts where users are not yet
+    in the in-memory ``user_stats``/``user_wallets`` dicts.
+    """
+    if user_id in user_stats:
+        return  # Already loaded — nothing to do
+    fpath = os.path.join(DATA_DIR, f"{user_id}.json")
+    if not os.path.exists(fpath):
+        return  # No file yet — new user
+    try:
+        with open(fpath, "r") as f:
+            data = json.load(f)
+        raw_wallet = data.get("wallet", 0.0)
+        if isinstance(raw_wallet, (int, float)):
+            user_wallets[user_id] = {"USDT": float(raw_wallet)}
+        elif isinstance(raw_wallet, dict):
+            clean_wallet = {}
+            for k, v in raw_wallet.items():
+                try:
+                    clean_wallet[k] = float(v)
+                except (TypeError, ValueError):
+                    logging.warning(f"load_user_data_if_missing: invalid wallet value for user {user_id}, coin {k}: {v}")
+            user_wallets[user_id] = clean_wallet if clean_wallet else {"USDT": 0.0}
+        else:
+            user_wallets[user_id] = {"USDT": 0.0}
+        if "active_currency" not in data:
+            data["active_currency"] = "USDT"
+        user_stats[user_id] = data
+        logging.info(f"load_user_data_if_missing: loaded user {user_id} from disk")
+    except Exception as e:
+        logging.error(f"load_user_data_if_missing: failed to load user {user_id}: {e}")
 
 ## NEW FEATURE - Data Persistence ##
 def save_bot_state():
