@@ -3951,6 +3951,10 @@ async def oxapay_webhook_handler(request: aiohttp.web.Request) -> aiohttp.web.Re
         amount_usd = float(data.get("amount", 0))
         # Use the actual currency paid (fallback to USDT for stablecoins)
         paid_currency = data.get("currency", "USDT").upper()
+        # payAmount is the actual crypto units received (e.g. 0.001 BTC, 0.5 ETH).
+        # Fallback to USD amount for stablecoins where payAmount may equal amount.
+        raw_pay = data.get("payAmount") if data.get("payAmount") is not None else data.get("pay_amount")
+        pay_amount = float(raw_pay) if raw_pay is not None else amount_usd
 
         # orderId format: {telegram_id}_{timestamp}
         telegram_id_str = order_id.split("_")[0] if "_" in order_id else ""
@@ -3961,13 +3965,14 @@ async def oxapay_webhook_handler(request: aiohttp.web.Request) -> aiohttp.web.Re
         telegram_id = int(telegram_id_str)
 
         if telegram_id in user_wallets:
-            credit_wallet_crypto(telegram_id, amount_usd, paid_currency)
+            # Credit the actual crypto amount (BTC→BTC, SOL→SOL, ETH→ETH, USDT→USDT, etc.)
+            credit_wallet_crypto(telegram_id, pay_amount, paid_currency)
             if telegram_id in user_stats:
                 user_stats[telegram_id]["unwagered_deposit"] = (
                     user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
                 )
             save_user_data(telegram_id)
-            logging.info(f"OxaPay: credited ${amount_usd} {paid_currency} to user {telegram_id}")
+            logging.info(f"OxaPay: credited {pay_amount} {paid_currency} (${amount_usd:.2f}) to user {telegram_id}")
         else:
             logging.warning(f"OxaPay webhook: user {telegram_id} not found in user_wallets")
 
@@ -14471,7 +14476,38 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
         return
 
-    await update.message.reply_text("No game or escrow deal found with that ID.")
+    # Check in active raffles
+    if unique_id in active_raffles:
+        raffle = active_raffles[unique_id]
+        user = update.effective_user
+        end_time = datetime.fromisoformat(raffle['end_time'].replace('Z', '+00:00'))
+        time_left = end_time - datetime.now(timezone.utc)
+        total_tickets = sum(raffle['tickets'].values())
+        participants = len(raffle['tickets'])
+        user_tickets = raffle['tickets'].get(user.id, 0)
+        user_wager = raffle['wager_tracker'].get(user.id, 0.0)
+        time_str = (f"{time_left.days}d {time_left.seconds // 3600}h {(time_left.seconds // 60) % 60}m"
+                    if time_left.total_seconds() > 0 else "Ended")
+        msg += (
+            f"<b>Type:</b> Raffle\n"
+            f"💰 <b>Prize Pool:</b> ${raffle['prize_usd']:.2f}\n"
+            f"🎫 <b>Ticket Cost:</b> ${raffle['ticket_cost']:.2f} wagered\n"
+            f"👥 <b>Type:</b> {raffle['type'].title()}\n"
+            f"🏆 <b>Winners:</b> {raffle['total_winners']}\n"
+            f"⏰ <b>Time Left:</b> {time_str}\n\n"
+            f"📊 <b>Statistics:</b>\n"
+            f"🎫 Total Tickets: {total_tickets}\n"
+            f"👥 Participants: {participants}\n\n"
+            f"<b>Your Progress:</b>\n"
+            f"🎫 Your Tickets: {user_tickets}\n"
+            f"💵 Your Wagered: ${user_wager:.2f}\n"
+        )
+        if raffle.get('type') == 'referrals':
+            msg += "\n💡 Only referrals of the creator can participate"
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+        return
+
+    await update.message.reply_text("❌ No game, escrow deal, or raffle found with that ID.", parse_mode=ParseMode.HTML)
 
 # --- MESSAGE LISTENER HANDLER ---
 @check_banned
@@ -17147,52 +17183,6 @@ async def raffles_back_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 @check_banned
 @check_maintenance
-async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show detailed raffle info"""
-    user = update.effective_user
-    await ensure_user_in_wallets(user.id, user.username, context=context)
-    
-    if not context.args or len(context.args) != 1:
-        await update.message.reply_text("Usage: <code>/info RAFFLE_ID</code>", parse_mode=ParseMode.HTML)
-        return
-    
-    raffle_id = context.args[0]
-    
-    if raffle_id not in active_raffles:
-        await update.message.reply_text("❌ Raffle not found or has ended.")
-        return
-    
-    raffle = active_raffles[raffle_id]
-    end_time = datetime.fromisoformat(raffle['end_time'].replace('Z', '+00:00'))
-    time_left = end_time - datetime.now(timezone.utc)
-    total_tickets = sum(raffle['tickets'].values())
-    participants = len(raffle['tickets'])
-    
-    # User's tickets
-    user_tickets = raffle['tickets'].get(user.id, 0)
-    user_wager = raffle['wager_tracker'].get(user.id, 0.0)
-    
-    msg = (
-        f"🎰 <b>Raffle Details</b>\n\n"
-        f"<b>ID:</b> <code>{raffle_id}</code>\n"
-        f"💰 <b>Prize Pool:</b> ${raffle['prize_usd']:.2f}\n"
-        f"🎫 <b>Ticket Cost:</b> ${raffle['ticket_cost']:.2f} wagered\n"
-        f"👥 <b>Type:</b> {raffle['type'].title()}\n"
-        f"🏆 <b>Winners:</b> {raffle['total_winners']}\n"
-        f"⏰ <b>Time Left:</b> {time_left.days}d {time_left.seconds//3600}h {(time_left.seconds//60)%60}m\n\n"
-        f"📊 <b>Statistics:</b>\n"
-        f"🎫 Total Tickets: {total_tickets}\n"
-        f"👥 Participants: {participants}\n\n"
-        f"<b>Your Progress:</b>\n"
-        f"🎫 Your Tickets: {user_tickets}\n"
-        f"💵 Your Wagered: ${user_wager:.2f}\n"
-    )
-    
-    if raffle['type'] == 'referrals':
-        msg += f"\n💡 Only referrals of the creator can participate"
-    
-    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
-
 ## NEW FEATURE - /level and /levelall commands ##
 def create_progress_bar(progress, total, length=10):
     """Creates a text-based progress bar."""
