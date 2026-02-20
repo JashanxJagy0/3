@@ -7,7 +7,9 @@ import os
 import warnings
 from datetime import datetime, timedelta, timezone
 import httpx
-from web3 import Web3
+import aiohttp
+from web3 import Web3, AsyncWeb3
+from web3.providers import AsyncHTTPProvider
 from eth_account import Account
 import secrets # For secure token generation
 import hashlib # For hashing PINs
@@ -41,6 +43,7 @@ from bip_utils import (
 
 # ===== DEPOSIT SYSTEM IMPORTS =====
 import sqlite3
+import aiosqlite
 import qrcode
 from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont
@@ -181,6 +184,14 @@ REFERRAL_BET_COMMISSION_RATE = 0.001      # 0.1%
 DEPOSIT_ENABLED = True
 DEPOSITS_DB = "deposits.db"
 
+# OxaPay merchant API key — get yours at https://oxapay.com/
+OXAPAY_MERCHANT_KEY = ""   # Fill in your OxaPay merchant key
+# Publicly reachable URL where your bot runs (needed for OxaPay webhook callbacks)
+OXAPAY_WEBHOOK_HOST = ""   # e.g. "https://your-server.com"
+OXAPAY_WEBHOOK_PORT = 8080  # Port for the aiohttp webhook listener
+# Currencies accepted by your OxaPay merchant account
+OXAPAY_SUPPORTED_CURRENCIES = {"BTC", "ETH", "USDT", "LTC", "TRX", "BNB", "SOL", "DOGE", "MATIC"}
+
 # ========================================
 # 🔐 SECURITY CRITICAL - FILL THESE VALUES
 # ========================================
@@ -208,12 +219,67 @@ MASTER_WALLETS = {
 # ========================================
 # Default public RPCs are provided - you can use your own for better performance
 RPC_ENDPOINTS = {
-    "ETH": "https://eth.llamarpc.com",                    # Or use Alchemy/Infura
-    "BNB": "https://bsc-dataseed.binance.org/",          # Or use NodeReal
-    "BASE": "https://mainnet.base.org",                   # Base mainnet
-    "TRON": "https://api.trongrid.io",                    # TronGrid
-    "SOLANA": "https://api.mainnet-beta.solana.com",     # Or use Helius
-    "TON": "https://toncenter.com/api/v2/jsonRPC"        # TON Center
+    "ETH": [
+        "https://eth.llamarpc.com",
+        "https://rpc.ankr.com/eth",
+        "https://cloudflare-eth.com",
+        "https://ethereum.publicnode.com",
+        "https://rpc.flashbots.net",
+        "https://eth.meowrpc.com",
+        "https://1rpc.io/eth",
+        "https://eth.drpc.org",
+        "https://api.stateless.solutions/eth-mainnet/v1/demo",
+        "https://eth-mainnet.public.blastapi.io",
+    ],
+    "BNB": [
+        "https://bsc-dataseed.binance.org/",
+        "https://bsc-dataseed1.defibit.io/",
+        "https://bsc-dataseed1.ninicoin.io/",
+        "https://bsc-dataseed2.defibit.io/",
+        "https://bsc-dataseed2.ninicoin.io/",
+        "https://bsc-dataseed3.defibit.io/",
+        "https://bsc-dataseed3.ninicoin.io/",
+        "https://bsc-dataseed4.defibit.io/",
+        "https://bsc-dataseed4.ninicoin.io/",
+        "https://binance.llamarpc.com",
+    ],
+    "BASE": [
+        "https://mainnet.base.org",
+        "https://base.llamarpc.com",
+        "https://base.publicnode.com",
+        "https://1rpc.io/base",
+        "https://base.drpc.org",
+        "https://base-mainnet.public.blastapi.io",
+        "https://base.meowrpc.com",
+        "https://rpc.notadegen.com/base",
+        "https://base.rpc.subquery.network/public",
+        "https://developer-access-mainnet.base.org",
+    ],
+    "TRON": [
+        "https://api.trongrid.io",
+        "https://api2.trongrid.io",
+        "https://rpc.ankr.com/tron_jsonrpc",
+        "https://trx.nownodes.io",
+        "https://tron-mainnet.public.blastapi.io",
+        "https://1rpc.io/trx",
+        "https://trx.drpc.org",
+        "https://api.tronstack.io",
+        "https://api.tronapi.io",
+        "https://fullnode.trongrid.io",
+    ],
+    "SOLANA": [
+        "https://api.mainnet-beta.solana.com",
+        "https://solana-mainnet.rpc.extrnode.com",
+        "https://rpc.ankr.com/solana",
+        "https://solana.publicnode.com",
+        "https://1rpc.io/sol",
+        "https://solana.drpc.org",
+        "https://solana-mainnet.public.blastapi.io",
+        "https://mainnet.helius-rpc.com/?api-key=demo",
+        "https://api.mainnet.solana.com",
+        "https://solana-rpc.publicnode.com",
+    ],
+    "TON": "https://toncenter.com/api/v2/jsonRPC",        # TON Center (single endpoint, not EVM)
 }
 
 # Token contracts (USDT/USDC on each chain)
@@ -579,6 +645,8 @@ leaderboard_last_update = {
 
 # --- Global Control Flag ---
 bot_stopped = False
+# Maps (telegram_id, chain) -> expiration datetime for on-demand 3-min deposit scanning
+active_manual_scans: dict = {}
 
 ## NEW FEATURE - Bot Settings ##
 bot_settings = {
@@ -1768,6 +1836,17 @@ class DepositDatabase:
             logging.info("Adding ton_private_key column to user_addresses table")
             cursor.execute("ALTER TABLE user_addresses ADD COLUMN ton_private_key TEXT")
             conn.commit()
+
+        # Migration: Add gas/sweep accounting columns (prevent gas-funding exploit)
+        for col, definition in [
+            ("last_native_balance", "REAL DEFAULT 0.0"),
+        ]:
+            try:
+                cursor.execute(f"SELECT {col} FROM user_addresses LIMIT 1")
+            except sqlite3.OperationalError:
+                logging.info(f"Adding {col} column to user_addresses table")
+                cursor.execute(f"ALTER TABLE user_addresses ADD COLUMN {col} {definition}")
+                conn.commit()
         
         # Deposits table
         cursor.execute('''
@@ -2103,6 +2182,351 @@ class DepositDatabase:
         finally:
             conn.close()
 
+    # ── Async helpers (used by background tasks to avoid DB locking) ──────
+
+    async def async_add_deposit(self, tx_hash, user_id, chain, amount, amount_usd,
+                                to_address, token=None, from_address=None, block_number=None):
+        """Async version of add_deposit using aiosqlite."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                try:
+                    await db.execute('''
+                        INSERT INTO deposits
+                        (tx_hash, user_id, chain, token, amount, amount_usd, from_address,
+                         to_address, block_number, status, confirmations)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0)
+                    ''', (tx_hash, user_id, chain, token, amount, amount_usd,
+                          from_address, to_address, block_number))
+                    await db.commit()
+                    cursor = await db.execute("SELECT last_insert_rowid()")
+                    row = await cursor.fetchone()
+                    deposit_id = row[0] if row else None
+                    logging.info(f"Added deposit {tx_hash} for user {user_id}")
+                    return deposit_id
+                except aiosqlite.IntegrityError:
+                    logging.warning(f"Deposit {tx_hash} already exists")
+                    return None
+        except Exception as e:
+            logging.error(f"async_add_deposit error: {e}")
+            return None
+
+    async def async_update_deposit_status(self, tx_hash, status, confirmations=None,
+                                          sweep_tx_hash=None, confirmed_at=None, swept_at=None):
+        """Async version of update_deposit_status using aiosqlite."""
+        try:
+            updates = ['status = ?']
+            params = [status]
+            if confirmations is not None:
+                updates.append('confirmations = ?')
+                params.append(confirmations)
+            if sweep_tx_hash:
+                updates.append('sweep_tx_hash = ?')
+                params.append(sweep_tx_hash)
+            if confirmed_at:
+                updates.append('confirmed_at = ?')
+                params.append(confirmed_at)
+            if swept_at:
+                updates.append('swept_at = ?')
+                params.append(swept_at)
+            params.append(tx_hash)
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    f"UPDATE deposits SET {', '.join(updates)} WHERE tx_hash = ?",
+                    params
+                )
+                await db.commit()
+        except Exception as e:
+            logging.error(f"async_update_deposit_status error: {e}")
+
+    async def async_get_recorded_unswept(self, user_id, chain, address, token=None):
+        """Return sum of already-recorded unswept deposits for an address (async)."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                if token is None:
+                    cursor = await db.execute('''
+                        SELECT COALESCE(SUM(amount), 0) FROM deposits
+                        WHERE user_id = ? AND chain = ? AND to_address = ? AND token IS NULL
+                        AND status IN ('pending', 'confirmed')
+                    ''', (user_id, chain, address))
+                else:
+                    cursor = await db.execute('''
+                        SELECT COALESCE(SUM(amount), 0) FROM deposits
+                        WHERE user_id = ? AND chain = ? AND to_address = ? AND token = ?
+                        AND status IN ('pending', 'confirmed')
+                    ''', (user_id, chain, address, token))
+                row = await cursor.fetchone()
+                return float(row[0]) if row else 0.0
+        except Exception as e:
+            logging.error(f"async_get_recorded_unswept error: {e}")
+            return 0.0
+
+    async def async_deposit_exists(self, tx_hash):
+        """Return True if deposit with tx_hash already exists (async)."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    'SELECT id FROM deposits WHERE tx_hash = ?', (tx_hash,)
+                )
+                return await cursor.fetchone() is not None
+        except Exception as e:
+            logging.error(f"async_deposit_exists error: {e}")
+            return False
+
+    async def async_get_all_user_addresses(self):
+        """Return all rows from user_addresses as list of dicts (async)."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    'SELECT user_id, telegram_id, address_index, eth_address, bnb_address, '
+                    'base_address, tron_address, solana_address, ton_address FROM user_addresses'
+                )
+                rows = await cursor.fetchall()
+                return rows
+        except Exception as e:
+            logging.error(f"async_get_all_user_addresses error: {e}")
+            return []
+
+    async def async_get_or_create_user(self, telegram_id: int) -> dict:
+        """Async version of get_or_create_user using aiosqlite.
+
+        Returns the same dict structure as the synchronous version.
+        Address generation (CPU-bound) is still done synchronously but is
+        only invoked for brand-new users so it does not block the loop
+        in steady-state operation.
+        """
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    'SELECT * FROM user_addresses WHERE telegram_id = ?', (telegram_id,)
+                )
+                user = await cursor.fetchone()
+
+                if user:
+                    return {
+                        'user_id': user['user_id'],
+                        'telegram_id': user['telegram_id'],
+                        'address_index': user['address_index'],
+                        'eth_address': user['eth_address'],
+                        'bnb_address': user['bnb_address'],
+                        'base_address': user['base_address'],
+                        'tron_address': user['tron_address'],
+                        'solana_address': user['solana_address'],
+                        'ton_address': user['ton_address'],
+                        'ton_private_key': user['ton_private_key'],
+                    }
+
+                # New user — generate addresses (sync, but only happens once per user)
+                cursor2 = await db.execute('SELECT MAX(address_index) FROM user_addresses')
+                row = await cursor2.fetchone()
+                max_index = row[0] if row and row[0] is not None else 0
+                next_index = max_index + 1
+
+                wallet_manager = HDWalletManager()
+                addresses = {}
+                ton_private_key = None
+                for chain in ['ETH', 'BNB', 'BASE', 'TRON', 'SOLANA', 'TON']:
+                    try:
+                        if chain == 'TON':
+                            ton_data = wallet_manager.generate_ton_with_key(next_index)
+                            if ton_data and isinstance(ton_data, dict) and 'address' in ton_data:
+                                addresses[chain] = ton_data['address']
+                                ton_private_key = ton_data.get('private_key')
+                            else:
+                                addresses[chain] = None
+                        else:
+                            addresses[chain] = wallet_manager.generate_address(chain, next_index)
+                    except Exception as e:
+                        logging.error(f"async_get_or_create_user: error generating {chain} address: {e}")
+                        addresses[chain] = None
+
+                await db.execute('''
+                    INSERT INTO user_addresses
+                    (telegram_id, address_index, eth_address, bnb_address, base_address,
+                     tron_address, solana_address, ton_address, ton_private_key)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (telegram_id, next_index, addresses['ETH'], addresses['BNB'],
+                      addresses['BASE'], addresses['TRON'], addresses['SOLANA'],
+                      addresses['TON'], ton_private_key))
+                await db.commit()
+
+                cursor3 = await db.execute('SELECT last_insert_rowid()')
+                row3 = await cursor3.fetchone()
+                user_id = row3[0] if row3 else next_index
+
+                logging.info(f"async_get_or_create_user: created deposit addresses for user {telegram_id} (index {next_index})")
+                return {
+                    'user_id': user_id,
+                    'telegram_id': telegram_id,
+                    'address_index': next_index,
+                    'eth_address': addresses['ETH'],
+                    'bnb_address': addresses['BNB'],
+                    'base_address': addresses['BASE'],
+                    'tron_address': addresses['TRON'],
+                    'solana_address': addresses['SOLANA'],
+                    'ton_address': addresses['TON'],
+                    'ton_private_key': ton_private_key,
+                }
+        except Exception as e:
+            logging.error(f"async_get_or_create_user error: {e}")
+            # Fallback to synchronous version
+            return self.get_or_create_user(telegram_id)
+
+    async def async_update_deposit_status_swept(self, tx_hash: str, sweep_tx_hash: str, swept_at: str):
+        """Async helper to mark a deposit as swept (used by AutoSweeper)."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    "UPDATE deposits SET status = 'swept', sweep_tx_hash = ?, swept_at = ? WHERE tx_hash = ?",
+                    (sweep_tx_hash, swept_at, tx_hash)
+                )
+                await db.commit()
+        except Exception as e:
+            logging.error(f"async_update_deposit_status_swept error: {e}")
+
+    # Whitelist mapping chain name → user_addresses column for that chain's deposit address.
+    # Used to build safe SQL WHERE clauses without f-string injection risk.
+    _CHAIN_ADDRESS_COL: dict = {
+        'ETH': 'eth_address',
+        'BNB': 'bnb_address',
+        'BASE': 'base_address',
+        'TRON': 'tron_address',
+        'SOLANA': 'solana_address',
+        'TON': 'ton_address',
+    }
+
+    async def async_get_last_native_balance(self, address: str, chain: str) -> float:
+        """Return the stored baseline native balance for an address (baseline tracking model)."""
+        col = self._CHAIN_ADDRESS_COL.get(chain)
+        if not col:
+            return 0.0
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    f"SELECT COALESCE(last_native_balance, 0) FROM user_addresses WHERE {col} = ?",
+                    (address,)
+                )
+                row = await cursor.fetchone()
+                return float(row[0]) if row else 0.0
+        except Exception as e:
+            logging.error(f"async_get_last_native_balance error: {e}")
+            return 0.0
+
+    async def async_update_last_native_balance(self, address: str, chain: str, new_balance: float):
+        """Persist the new baseline native balance for an address."""
+        col = self._CHAIN_ADDRESS_COL.get(chain)
+        if not col:
+            return
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    f"UPDATE user_addresses SET last_native_balance = ? WHERE {col} = ?",
+                    (new_balance, address)
+                )
+                await db.commit()
+        except Exception as e:
+            logging.error(f"async_update_last_native_balance error: {e}")
+
+    async def async_increment_last_native_balance(self, address: str, chain: str, delta: float):
+        """Atomically add *delta* to last_native_balance (used after gas funding)."""
+        col = self._CHAIN_ADDRESS_COL.get(chain)
+        if not col:
+            return
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    f"UPDATE user_addresses "
+                    f"SET last_native_balance = COALESCE(last_native_balance, 0) + ? "
+                    f"WHERE {col} = ?",
+                    (delta, address)
+                )
+                await db.commit()
+        except Exception as e:
+            logging.error(f"async_increment_last_native_balance error: {e}")
+
+    async def async_lower_last_native_balance_if_less(self, address: str, chain: str, candidate: float):
+        """Atomically set last_native_balance = candidate only if candidate < current value.
+
+        Used after a sweep confirms to reflect the post-sweep on-chain balance without
+        overwriting a higher baseline that may have been written by a concurrent deposit.
+        """
+        col = self._CHAIN_ADDRESS_COL.get(chain)
+        if not col:
+            return
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    f"UPDATE user_addresses "
+                    f"SET last_native_balance = ? "
+                    f"WHERE {col} = ? AND COALESCE(last_native_balance, 0) > ?",
+                    (candidate, address, candidate)
+                )
+                await db.commit()
+        except Exception as e:
+            logging.error(f"async_lower_last_native_balance_if_less error: {e}")
+
+    async def async_get_user_deposits(self, telegram_id: int, limit: int = 10):
+        """Async version of get_user_deposits using aiosqlite."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute('''
+                    SELECT d.tx_hash, d.chain, d.token, d.amount, d.amount_usd,
+                           d.status, d.created_at, d.confirmed_at
+                    FROM deposits d
+                    JOIN user_addresses u ON d.user_id = u.user_id
+                    WHERE u.telegram_id = ?
+                    ORDER BY d.created_at DESC
+                    LIMIT ?
+                ''', (telegram_id, limit))
+                return await cursor.fetchall()
+        except Exception as e:
+            logging.error(f"async_get_user_deposits error: {e}")
+            return []
+
+
+class OxaPayService:
+    """OxaPay payment gateway integration."""
+
+    API_URL = "https://api.oxapay.com/merchants/request"
+
+    def __init__(self, merchant_key: str, webhook_host: str):
+        self.merchant_key = merchant_key
+        self.callback_url = f"{webhook_host}/oxapay_webhook" if webhook_host else ""
+
+    async def create_invoice(self, user_id: int, amount_usd: float, currency: str) -> str | None:
+        """Create an OxaPay invoice and return the payUrl, or None on failure."""
+        if not self.merchant_key:
+            logging.warning("OXAPAY_MERCHANT_KEY is not configured.")
+            return None
+        order_id = f"{user_id}_{int(datetime.now().timestamp())}"
+        payload = {
+            "merchant": self.merchant_key,
+            "amount": amount_usd,
+            "currency": currency,
+            "orderId": order_id,
+            "callbackUrl": self.callback_url,
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(self.API_URL, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status != 200:
+                        logging.error(f"OxaPay invoice HTTP error {resp.status}")
+                        return None
+                    data = await resp.json()
+                    if data.get("result") == 100:
+                        return data.get("payLink") or data.get("payUrl")
+                    logging.error(f"OxaPay invoice error response: {data}")
+                    return None
+        except asyncio.TimeoutError:
+            logging.error("OxaPay create_invoice timed out")
+            return None
+        except aiohttp.ClientError as e:
+            logging.error(f"OxaPay create_invoice network error: {e}")
+            return None
+        except Exception as e:
+            logging.error(f"OxaPay create_invoice exception: {e}")
+            return None
+
 
 class HDWalletManager:
     """HD Wallet Manager for multi-chain address generation"""
@@ -2236,15 +2660,50 @@ class EvmService:
     
     def __init__(self, chain):
         self.chain = chain
-        self.rpc_url = RPC_ENDPOINTS[chain]
-        self.w3 = Web3(Web3.HTTPProvider(self.rpc_url))
+        self.rpc_urls = RPC_ENDPOINTS[chain]
+        self.current_rpc_index = 0
+        self.w3 = AsyncWeb3(AsyncHTTPProvider(self.rpc_urls[self.current_rpc_index]))
         self.master_wallet = MASTER_WALLETS[chain]
-    
+
+    def _rotate_rpc(self):
+        """Rotate to the next RPC endpoint."""
+        self.current_rpc_index = (self.current_rpc_index + 1) % len(self.rpc_urls)
+        self.w3 = AsyncWeb3(AsyncHTTPProvider(self.rpc_urls[self.current_rpc_index]))
+        logging.info(f"{self.chain}: switched to RPC {self.rpc_urls[self.current_rpc_index]}")
+
+    async def _execute_with_fallback(self, func, *args):
+        """Execute an async Web3 call with RPC fallback on failure."""
+        last_exc = None
+        for attempt in range(len(self.rpc_urls)):
+            try:
+                return await func(*args)
+            except Exception as e:
+                err_str = str(e).lower()
+                if any(kw in err_str for kw in ("429", "rate limit", "timeout", "connection", "network")):
+                    logging.warning(f"{self.chain} RPC error on {self.rpc_urls[self.current_rpc_index]}: {e}. Rotating RPC.")
+                    self._rotate_rpc()
+                    last_exc = e
+                else:
+                    raise
+        logging.error(f"{self.chain}: all {len(self.rpc_urls)} RPCs failed. Last error: {last_exc}")
+        return None
+
+    async def _fetch_gas_price(self):
+        return await self.w3.eth.gas_price
+
+    async def _fetch_chain_id(self):
+        return await self.w3.eth.chain_id
+
+    async def _fetch_block_number(self):
+        return await self.w3.eth.block_number
+
     async def get_balance(self, address):
         """Get native token balance"""
         try:
-            balance_wei = self.w3.eth.get_balance(address)
-            balance = self.w3.from_wei(balance_wei, 'ether')
+            balance_wei = await self._execute_with_fallback(self.w3.eth.get_balance, address)
+            if balance_wei is None:
+                return 0.0
+            balance = Web3.from_wei(balance_wei, 'ether')
             return float(balance)
         except Exception as e:
             logging.error(f"Error getting {self.chain} balance for {address}: {e}")
@@ -2263,7 +2722,11 @@ class EvmService:
                     "type": "function"
                 }]
             )
-            balance = contract.functions.balanceOf(Web3.to_checksum_address(address)).call()
+            balance = await self._execute_with_fallback(
+                contract.functions.balanceOf(Web3.to_checksum_address(address)).call
+            )
+            if balance is None:
+                return 0.0
             return balance / (10 ** decimals)
         except Exception as e:
             logging.error(f"Error getting token balance: {e}")
@@ -2280,9 +2743,11 @@ class EvmService:
                 return None
             
             # Get gas price
-            gas_price = self.w3.eth.gas_price
+            gas_price = await self._execute_with_fallback(self._fetch_gas_price)
+            if gas_price is None:
+                return None
             gas_limit = 21000
-            gas_cost = self.w3.from_wei(gas_price * gas_limit, 'ether')
+            gas_cost = Web3.from_wei(gas_price * gas_limit, 'ether')
             
             # Calculate amount to send
             if amount is None:
@@ -2293,19 +2758,25 @@ class EvmService:
                 return None
             
             # Build transaction
+            nonce = await self._execute_with_fallback(self.w3.eth.get_transaction_count, from_address)
+            chain_id = await self._execute_with_fallback(self._fetch_chain_id)
             tx = {
                 'from': Web3.to_checksum_address(from_address),
                 'to': Web3.to_checksum_address(self.master_wallet),
-                'value': self.w3.to_wei(amount, 'ether'),
+                'value': Web3.to_wei(amount, 'ether'),
                 'gas': gas_limit,
                 'gasPrice': gas_price,
-                'nonce': self.w3.eth.get_transaction_count(from_address),
-                'chainId': self.w3.eth.chain_id
+                'nonce': nonce,
+                'chainId': chain_id
             }
             
             # Sign and send
             signed = self.w3.eth.account.sign_transaction(tx, private_key)
-            tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
+            tx_hash = await self._execute_with_fallback(
+                self.w3.eth.send_raw_transaction, signed.rawTransaction
+            )
+            if tx_hash is None:
+                return None
             
             logging.info(f"Swept {amount} {self.chain} from {from_address} - TX: {tx_hash.hex()}")
             return tx_hash.hex()
@@ -2341,20 +2812,27 @@ class EvmService:
             
             # Build transaction
             amount_wei = int(balance * (10 ** decimals))
-            tx = contract.functions.transfer(
+            gas_price = await self._execute_with_fallback(self._fetch_gas_price)
+            nonce = await self._execute_with_fallback(self.w3.eth.get_transaction_count, from_address)
+            chain_id = await self._execute_with_fallback(self._fetch_chain_id)
+            tx = await contract.functions.transfer(
                 Web3.to_checksum_address(self.master_wallet),
                 amount_wei
             ).build_transaction({
                 'from': Web3.to_checksum_address(from_address),
                 'gas': 100000,
-                'gasPrice': self.w3.eth.gas_price,
-                'nonce': self.w3.eth.get_transaction_count(from_address),
-                'chainId': self.w3.eth.chain_id
+                'gasPrice': gas_price,
+                'nonce': nonce,
+                'chainId': chain_id
             })
             
             # Sign and send
             signed = self.w3.eth.account.sign_transaction(tx, private_key)
-            tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
+            tx_hash = await self._execute_with_fallback(
+                self.w3.eth.send_raw_transaction, signed.rawTransaction
+            )
+            if tx_hash is None:
+                return None
             
             logging.info(f"Swept {balance} tokens from {from_address} - TX: {tx_hash.hex()}")
             return tx_hash.hex()
@@ -2368,18 +2846,25 @@ class EvmService:
         try:
             hot_wallet = Account.from_key(HOT_WALLET_PRIVATE_KEY)
             
+            gas_price = await self._execute_with_fallback(self._fetch_gas_price)
+            nonce = await self._execute_with_fallback(self.w3.eth.get_transaction_count, hot_wallet.address)
+            chain_id = await self._execute_with_fallback(self._fetch_chain_id)
             tx = {
                 'from': hot_wallet.address,
                 'to': Web3.to_checksum_address(to_address),
-                'value': self.w3.to_wei(amount, 'ether'),
+                'value': Web3.to_wei(amount, 'ether'),
                 'gas': 21000,
-                'gasPrice': self.w3.eth.gas_price,
-                'nonce': self.w3.eth.get_transaction_count(hot_wallet.address),
-                'chainId': self.w3.eth.chain_id
+                'gasPrice': gas_price,
+                'nonce': nonce,
+                'chainId': chain_id
             }
             
             signed = self.w3.eth.account.sign_transaction(tx, HOT_WALLET_PRIVATE_KEY)
-            tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
+            tx_hash = await self._execute_with_fallback(
+                self.w3.eth.send_raw_transaction, signed.rawTransaction
+            )
+            if tx_hash is None:
+                return None
             
             logging.info(f"Funded {to_address} with {amount} {self.chain} - TX: {tx_hash.hex()}")
             return tx_hash.hex()
@@ -2391,7 +2876,9 @@ class EvmService:
     async def scan_address(self, address, last_block=None):
         """Scan address for new transactions using getLogs (event-based, more efficient)"""
         try:
-            current_block = self.w3.eth.block_number
+            current_block = await self._execute_with_fallback(self._fetch_block_number)
+            if current_block is None:
+                return [], None
             
             # Limit scan range to prevent timeout (max 1000 blocks)
             start_block = last_block + 1 if last_block else max(0, current_block - 100)
@@ -2429,12 +2916,17 @@ class EvmService:
             # Pad address to 32-byte topic (left-pad with zeros)
             padded_address = "0x" + address.lower().replace("0x", "").zfill(64)
 
-            logs = self.w3.eth.get_logs({
-                'fromBlock': from_block,
-                'toBlock': to_block,
-                'address': Web3.to_checksum_address(token_contract),
-                'topics': [TRANSFER_TOPIC, None, padded_address]
-            })
+            logs = await self._execute_with_fallback(
+                self.w3.eth.get_logs,
+                {
+                    'fromBlock': from_block,
+                    'toBlock': to_block,
+                    'address': Web3.to_checksum_address(token_contract),
+                    'topics': [TRANSFER_TOPIC, None, padded_address]
+                }
+            )
+            if logs is None:
+                return []
 
             transfers = []
             for log in logs:
@@ -2452,12 +2944,8 @@ class EvmService:
             return []
 
     async def wait_for_receipt(self, tx_hash, timeout=120):
-        """Wait for a transaction to be mined, running the blocking call in an executor"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None,
-            lambda: self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
-        )
+        """Wait for a transaction to be mined"""
+        return await self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
 
 
 class TronService:
@@ -2467,13 +2955,39 @@ class TronService:
         if not TRON_AVAILABLE:
             raise ImportError("TRON library not available")
         self.chain = "TRON"
-        self.tron = Tron(network='mainnet')
+        self.rpc_urls = RPC_ENDPOINTS['TRON']
+        self.current_rpc_index = 0
+        self.tron = Tron(full_node=self.rpc_urls[self.current_rpc_index])
         self.master_wallet = MASTER_WALLETS['TRON']
-    
+
+    def _rotate_rpc(self):
+        """Rotate to the next TRON RPC endpoint."""
+        self.current_rpc_index = (self.current_rpc_index + 1) % len(self.rpc_urls)
+        self.tron = Tron(full_node=self.rpc_urls[self.current_rpc_index])
+        logging.info(f"TRON: switched to RPC {self.rpc_urls[self.current_rpc_index]}")
+
+    async def _execute_with_fallback(self, func, *args):
+        """Execute a synchronous tronpy call in an executor with RPC fallback."""
+        loop = asyncio.get_event_loop()
+        last_exc = None
+        for attempt in range(len(self.rpc_urls)):
+            try:
+                return await loop.run_in_executor(None, func, *args)
+            except Exception as e:
+                err_str = str(e).lower()
+                if any(kw in err_str for kw in ("429", "rate limit", "timeout", "connection", "network")):
+                    logging.warning(f"TRON RPC error on {self.rpc_urls[self.current_rpc_index]}: {e}. Rotating RPC.")
+                    self._rotate_rpc()
+                    last_exc = e
+                else:
+                    raise
+        logging.error(f"TRON: all {len(self.rpc_urls)} RPCs failed. Last error: {last_exc}")
+        return None
+
     async def get_balance(self, address):
         """Get TRX balance"""
         try:
-            balance = self.tron.get_account_balance(address)
+            balance = await self._execute_with_fallback(self.tron.get_account_balance, address)
             return balance if balance else 0.0
         except Exception as e:
             logging.error(f"Error getting TRON balance: {e}")
@@ -2482,10 +2996,13 @@ class TronService:
     async def get_token_balance(self, address, token_contract):
         """Get TRC20 token balance"""
         try:
-            contract = self.tron.get_contract(token_contract)
-            balance = contract.functions.balanceOf(address)
-            decimals = contract.functions.decimals()
-            return balance / (10 ** decimals)
+            def _get_token_bal():
+                contract = self.tron.get_contract(token_contract)
+                balance = contract.functions.balanceOf(address)
+                decimals = contract.functions.decimals()
+                return balance / (10 ** decimals)
+            result = await self._execute_with_fallback(_get_token_bal)
+            return result if result is not None else 0.0
         except Exception as e:
             logging.error(f"Error getting TRON token balance: {e}")
             return 0.0
@@ -2501,16 +3018,19 @@ class TronService:
             
             # Reserve some TRX for fees
             amount = balance - 1.1
+            master_wallet = self.master_wallet
+
+            def _do_sweep():
+                tx = (
+                    self.tron.trx.transfer(from_address, master_wallet, int(amount * 1_000_000))
+                    .build()
+                    .sign(priv_key)
+                )
+                return tx.broadcast()
+
+            result = await self._execute_with_fallback(_do_sweep)
             
-            tx = (
-                self.tron.trx.transfer(from_address, self.master_wallet, int(amount * 1_000_000))
-                .build()
-                .sign(priv_key)
-            )
-            
-            result = tx.broadcast()
-            
-            if result.get('result'):
+            if result and result.get('result'):
                 tx_hash = result.get('txid')
                 logging.info(f"Swept {amount} TRX from {from_address} - TX: {tx_hash}")
                 return tx_hash
@@ -2524,26 +3044,28 @@ class TronService:
         """Sweep TRC20 tokens to master wallet"""
         try:
             priv_key = TronPrivateKey(bytes.fromhex(private_key))
-            contract = self.tron.get_contract(token_contract)
-            
             balance = await self.get_token_balance(from_address, token_contract)
             if balance == 0:
                 return None
             
-            decimals = contract.functions.decimals()
-            amount = int(balance * (10 ** decimals))
+            master_wallet = self.master_wallet
+
+            def _do_token_sweep():
+                contract = self.tron.get_contract(token_contract)
+                decimals = contract.functions.decimals()
+                amount = int(balance * (10 ** decimals))
+                tx = (
+                    contract.functions.transfer(master_wallet, amount)
+                    .with_owner(from_address)
+                    .fee_limit(50_000_000)
+                    .build()
+                    .sign(priv_key)
+                )
+                return tx.broadcast()
+
+            result = await self._execute_with_fallback(_do_token_sweep)
             
-            tx = (
-                contract.functions.transfer(self.master_wallet, amount)
-                .with_owner(from_address)
-                .fee_limit(50_000_000)
-                .build()
-                .sign(priv_key)
-            )
-            
-            result = tx.broadcast()
-            
-            if result.get('result'):
+            if result and result.get('result'):
                 tx_hash = result.get('txid')
                 logging.info(f"Swept {balance} tokens from {from_address} - TX: {tx_hash}")
                 return tx_hash
@@ -2558,16 +3080,18 @@ class TronService:
         try:
             hot_priv_key = TronPrivateKey(bytes.fromhex(HOT_WALLET_PRIVATE_KEY.replace('0x', '')))
             hot_address = hot_priv_key.public_key.to_base58check_address()
+
+            def _do_fund():
+                tx = (
+                    self.tron.trx.transfer(hot_address, to_address, int(amount * 1_000_000))
+                    .build()
+                    .sign(hot_priv_key)
+                )
+                return tx.broadcast()
+
+            result = await self._execute_with_fallback(_do_fund)
             
-            tx = (
-                self.tron.trx.transfer(hot_address, to_address, int(amount * 1_000_000))
-                .build()
-                .sign(hot_priv_key)
-            )
-            
-            result = tx.broadcast()
-            
-            if result.get('result'):
+            if result and result.get('result'):
                 return result.get('txid')
             return None
             
@@ -2583,18 +3107,43 @@ class SolanaService:
         if not SOLANA_AVAILABLE:
             raise ImportError("Solana library not available")
         self.chain = "SOLANA"
-        self.rpc_url = RPC_ENDPOINTS['SOLANA']
+        self.rpc_urls = RPC_ENDPOINTS['SOLANA']
+        self.current_rpc_index = 0
         self.master_wallet = MASTER_WALLETS['SOLANA']
-    
+
+    def _rotate_rpc(self):
+        """Rotate to the next Solana RPC endpoint."""
+        self.current_rpc_index = (self.current_rpc_index + 1) % len(self.rpc_urls)
+        logging.info(f"SOLANA: switched to RPC {self.rpc_urls[self.current_rpc_index]}")
+
+    async def _execute_with_fallback(self, coro_func, *args):
+        """Execute an async Solana client call with RPC fallback."""
+        last_exc = None
+        for attempt in range(len(self.rpc_urls)):
+            rpc_url = self.rpc_urls[self.current_rpc_index]
+            try:
+                async with SolanaClient(rpc_url) as client:
+                    return await coro_func(client, *args)
+            except Exception as e:
+                err_str = str(e).lower()
+                if any(kw in err_str for kw in ("429", "rate limit", "timeout", "connection", "network")):
+                    logging.warning(f"SOLANA RPC error on {rpc_url}: {e}. Rotating RPC.")
+                    self._rotate_rpc()
+                    last_exc = e
+                else:
+                    raise
+        logging.error(f"SOLANA: all {len(self.rpc_urls)} RPCs failed. Last error: {last_exc}")
+        return None
+
     async def get_balance(self, address):
         """Get SOL balance"""
         try:
-            async with SolanaClient(self.rpc_url) as client:
-                pubkey = SoldersPubkey.from_string(address)
+            pubkey = SoldersPubkey.from_string(address)
+            async def _get(client):
                 response = await client.get_balance(pubkey)
-                if response.value:
-                    return response.value / 1e9  # Convert lamports to SOL
-                return 0.0
+                return response.value / 1e9 if response.value else 0.0
+            result = await self._execute_with_fallback(_get)
+            return result if result is not None else 0.0
         except Exception as e:
             logging.error(f"Error getting Solana balance: {e}")
             return 0.0
@@ -2602,15 +3151,14 @@ class SolanaService:
     async def get_token_balance(self, address, mint_address):
         """Get SPL token balance"""
         try:
-            async with SolanaClient(self.rpc_url) as client:
-                pubkey = SoldersPubkey.from_string(address)
+            pubkey = SoldersPubkey.from_string(address)
+            mint_pubkey = SoldersPubkey.from_string(mint_address)
+            async def _get(client):
                 response = await client.get_token_accounts_by_owner(
                     pubkey,
-                    {"mint": SoldersPubkey.from_string(mint_address)}
+                    {"mint": mint_pubkey}
                 )
-                
                 if response.value:
-                    # Parse token account data
                     import struct
                     for account in response.value:
                         data = account.account.data
@@ -2619,6 +3167,8 @@ class SolanaService:
                         decimals = TOKEN_CONTRACTS['SOLANA'].get('USDT', {}).get('decimals', 6)
                         return amount / (10 ** decimals)
                 return 0.0
+            result = await self._execute_with_fallback(_get)
+            return result if result is not None else 0.0
         except Exception as e:
             logging.error(f"Error getting Solana token balance: {e}")
             return 0.0
@@ -2626,43 +3176,33 @@ class SolanaService:
     async def sweep(self, from_address, private_key_bytes):
         """Sweep SOL to master wallet"""
         try:
-            async with SolanaClient(self.rpc_url) as client:
-                # Create keypair from private key bytes
-                from_keypair = SoldersKeypair.from_bytes(private_key_bytes)
-                
-                # Get balance
+            from_keypair = SoldersKeypair.from_bytes(private_key_bytes)
+            master_wallet = self.master_wallet
+
+            async def _do_sweep(client):
                 balance_response = await client.get_balance(from_keypair.pubkey())
                 balance_lamports = balance_response.value
-                
-                # Reserve for fees (5000 lamports)
                 if balance_lamports < 10000:
                     return None
-                
                 amount = balance_lamports - 5000
-                
-                # Create transfer instruction
                 transfer_ix = solders_transfer(
                     SoldersTransferParams(
                         from_pubkey=from_keypair.pubkey(),
-                        to_pubkey=SoldersPubkey.from_string(self.master_wallet),
+                        to_pubkey=SoldersPubkey.from_string(master_wallet),
                         lamports=amount
                     )
                 )
-                
-                # Get recent blockhash
                 blockhash_response = await client.get_latest_blockhash()
                 recent_blockhash = blockhash_response.value.blockhash
-                
-                # Create and sign transaction
                 tx = SoldersTransaction.new_with_payer([transfer_ix], from_keypair.pubkey())
                 tx.partial_sign([from_keypair], recent_blockhash)
-                
-                # Send transaction
                 result = await client.send_transaction(tx)
-                tx_hash = str(result.value)
-                
-                logging.info(f"Swept {amount/1e9} SOL from {from_address} - TX: {tx_hash}")
-                return tx_hash
+                return str(result.value)
+
+            tx_hash = await self._execute_with_fallback(_do_sweep)
+            if tx_hash:
+                logging.info(f"Swept SOL from {from_address} - TX: {tx_hash}")
+            return tx_hash
                 
         except Exception as e:
             logging.error(f"Error sweeping Solana: {e}")
@@ -2671,17 +3211,13 @@ class SolanaService:
     async def fund_gas(self, to_address, amount=0.001):
         """Fund address with SOL for fees"""
         try:
-            async with SolanaClient(self.rpc_url) as client:
-                # Create hot wallet keypair from private key
-                hot_priv_bytes = bytes.fromhex(HOT_WALLET_PRIVATE_KEY.replace('0x', ''))
-                # Pad to 64 bytes if needed (32 private + 32 public)
-                if len(hot_priv_bytes) == 32:
-                    # Need to derive the full keypair
-                    hot_keypair = SoldersKeypair.from_seed(hot_priv_bytes)
-                else:
-                    hot_keypair = SoldersKeypair.from_bytes(hot_priv_bytes)
-                
-                # Create transfer
+            hot_priv_bytes = bytes.fromhex(HOT_WALLET_PRIVATE_KEY.replace('0x', ''))
+            if len(hot_priv_bytes) == 32:
+                hot_keypair = SoldersKeypair.from_seed(hot_priv_bytes)
+            else:
+                hot_keypair = SoldersKeypair.from_bytes(hot_priv_bytes)
+
+            async def _do_fund(client):
                 transfer_ix = solders_transfer(
                     SoldersTransferParams(
                         from_pubkey=hot_keypair.pubkey(),
@@ -2689,16 +3225,14 @@ class SolanaService:
                         lamports=int(amount * 1e9)
                     )
                 )
-                
                 blockhash_response = await client.get_latest_blockhash()
                 recent_blockhash = blockhash_response.value.blockhash
-                
                 tx = SoldersTransaction.new_with_payer([transfer_ix], hot_keypair.pubkey())
                 tx.partial_sign([hot_keypair], recent_blockhash)
-                
                 result = await client.send_transaction(tx)
-                
                 return str(result.value)
+
+            return await self._execute_with_fallback(_do_fund)
                 
         except Exception as e:
             logging.error(f"Error funding Solana gas: {e}")
@@ -2812,16 +3346,18 @@ class BlockMonitor:
                         await self._scan_address(chain, address, user_id, telegram_id)
                         # Add small delay to prevent rate limiting
                         await asyncio.sleep(0.1)
+                # Throttle between users to preserve RPC compute units
+                await asyncio.sleep(0.5)
             
         except Exception as e:
             logging.error(f"Error in scan_all_addresses: {e}")
     
-    async def scan_address(self, chain, address, user_id, telegram_id):
-        """Scan single address for deposits - Public interface"""
-        await self._scan_address(chain, address, user_id, telegram_id)
+    async def scan_address(self, chain, address, user_id, telegram_id, bot=None):
+        """Scan single address for deposits - Public interface. Returns True if new deposit found."""
+        return await self._scan_address(chain, address, user_id, telegram_id, bot=bot)
     
-    async def _scan_address(self, chain, address, user_id, telegram_id):
-        """Scan single address for deposits"""
+    async def _scan_address(self, chain, address, user_id, telegram_id, bot=None):
+        """Scan single address for deposits. Returns True if a new deposit was detected."""
         # Map each chain to its native coin symbol
         NATIVE_SYMBOLS = {
             'ETH': 'ETH',
@@ -2831,33 +3367,28 @@ class BlockMonitor:
             'SOLANA': 'SOL',
             'TON': 'TON',
         }
+        found_deposit = False
         try:
             service = self.services.get(chain)
             if not service:
-                return
+                return False
 
-            # ── Native balance delta ─────────────────────────────────────────
+            # ── Native balance delta (baseline tracking model) ──────────────
+            # Compare current on-chain balance against the stored baseline.
+            # The baseline is updated every time a new deposit is credited or
+            # after a sweep confirms, so gas fees and sweep dust are handled
+            # correctly without under-crediting the user.
             balance = await service.get_balance(address)
 
-            conn = self.db.get_connection()
-            cursor = conn.cursor()
-            # Sum of native deposits already recorded but not yet swept
-            cursor.execute('''
-                SELECT COALESCE(SUM(amount), 0) FROM deposits
-                WHERE user_id = ? AND chain = ? AND to_address = ? AND token IS NULL
-                AND status IN ('pending', 'confirmed')
-            ''', (user_id, chain, address))
-            recorded_unswept = float(cursor.fetchone()[0])
-            conn.close()
-
-            new_native_amount = balance - recorded_unswept
-            if new_native_amount > 0.0001:  # Minimum threshold
+            last_native_balance = await self.db.async_get_last_native_balance(address, chain)
+            new_native_amount = balance - last_native_balance
+            if new_native_amount > 0.0001:  # Minimum threshold (native units)
                 symbol = NATIVE_SYMBOLS.get(chain, chain)
                 price_usd = await get_crypto_price_usd(symbol)
                 amount_usd = new_native_amount * price_usd
                 tx_hash = f"native_{chain}_{address}_{int(datetime.now().timestamp())}"
 
-                deposit_id = self.db.add_deposit(
+                deposit_id = await self.db.async_add_deposit(
                     tx_hash=tx_hash,
                     user_id=user_id,
                     chain=chain,
@@ -2867,9 +3398,12 @@ class BlockMonitor:
                 )
 
                 if deposit_id:
+                    found_deposit = True
+                    # Advance baseline to current balance now that the deposit is recorded
+                    await self.db.async_update_last_native_balance(address, chain, balance)
                     logging.info(f"New native deposit: {new_native_amount} {symbol} for user {telegram_id} (${amount_usd:.2f})")
                     required_confs = CONFIRMATIONS.get(chain, 10)
-                    self.db.update_deposit_status(tx_hash, 'confirmed', confirmations=required_confs)
+                    await self.db.async_update_deposit_status(tx_hash, 'confirmed', confirmations=required_confs)
 
                     if telegram_id in user_wallets:
                         credit_wallet_crypto(telegram_id, new_native_amount, symbol)
@@ -2878,21 +3412,34 @@ class BlockMonitor:
                                 user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
                             )
                         
-                        # NEW: Referral deposit commission (0.5%)
+                        # Referral deposit commission (0.5%)
                         if telegram_id in user_stats:
-                            referrer_id = user_stats[telegram_id]['referral'].get('referrer_id')
+                            ref_data = user_stats[telegram_id].get('referral', {})
+                            referrer_id = ref_data.get('referrer_id')
                             if referrer_id and referrer_id in user_stats:
-                                commission = new_native_amount * 0.005  # 0.5% in native crypto
-                                if 'commissions' not in user_stats[referrer_id]['referral']:
-                                    user_stats[referrer_id]['referral']['commissions'] = {}
-                                user_stats[referrer_id]['referral']['commissions'][symbol] = (
-                                    user_stats[referrer_id]['referral']['commissions'].get(symbol, 0.0) + commission
-                                )
+                                commission = new_native_amount * 0.005
+                                ref_dict = user_stats[referrer_id].setdefault('referral', {})
+                                comm_dict = ref_dict.setdefault('commissions', {})
+                                comm_dict[symbol] = comm_dict.get(symbol, 0.0) + commission
                                 save_user_data(referrer_id)
                                 logging.info(f"Credited {commission} {symbol} deposit commission to referrer {referrer_id}")
                         
                         save_user_data(telegram_id)
                         logging.info(f"Credited {new_native_amount} {symbol} to user {telegram_id}")
+                    
+                    if bot:
+                        try:
+                            await bot.send_message(
+                                chat_id=telegram_id,
+                                text=(
+                                    f"🎉 <b>Deposit Received!</b>\n\n"
+                                    f"✅ <b>{new_native_amount:.6f} {symbol}</b> (${amount_usd:.2f}) "
+                                    f"detected on {chain} and credited to your balance!"
+                                ),
+                                parse_mode=ParseMode.HTML
+                            )
+                        except Exception as notify_err:
+                            logging.warning(f"Could not notify user {telegram_id}: {notify_err}")
 
             # ── Token deposits ───────────────────────────────────────────────
             if chain in TOKEN_CONTRACTS:
@@ -2901,80 +3448,96 @@ class BlockMonitor:
                     # EVM chains: use Transfer event logs so each tx is tracked individually
                     if chain in ('ETH', 'BNB', 'BASE') and hasattr(service, 'get_erc20_deposits'):
                         track_key = (chain, address, token_name)
-                        current_block = service.w3.eth.block_number
+                        # Use the async fetch_block_number to avoid blocking the event loop
+                        current_block = await service._execute_with_fallback(service._fetch_block_number)
+                        if current_block is None:
+                            continue
                         from_block = self.last_scanned_blocks.get(track_key)
                         if from_block is None:
-                            # First scan – look back ~100 blocks (~20 min on ETH/BNB) to avoid
-                            # re-crediting deposits that were processed before the last restart.
+                            # First scan – look back ~100 blocks to avoid re-crediting old deposits
                             from_block = max(0, current_block - 100)
                         else:
                             from_block = from_block + 1
 
                         if from_block <= current_block:
-                            transfers = await service.get_erc20_deposits(
-                                address,
-                                token_info['address'],
-                                token_info['decimals'],
-                                from_block,
-                                current_block
-                            )
-                            self.last_scanned_blocks[track_key] = current_block
-
-                            for transfer in transfers:
-                                tx_hash = transfer['tx_hash']
-                                token_amount = transfer['amount']
-
-                                if token_amount < 1:
-                                    continue
-
-                                # Skip if this tx_hash is already in the database
-                                conn = self.db.get_connection()
-                                cursor = conn.cursor()
-                                cursor.execute('SELECT id FROM deposits WHERE tx_hash = ?', (tx_hash,))
-                                already_exists = cursor.fetchone()
-                                conn.close()
-                                if already_exists:
-                                    continue
-
-                                amount_usd = token_amount  # Assumes stablecoin (USDT/USDC) 1:1 with USD
-                                deposit_id = self.db.add_deposit(
-                                    tx_hash=tx_hash,
-                                    user_id=user_id,
-                                    chain=chain,
-                                    token=token_name,
-                                    amount=token_amount,
-                                    amount_usd=amount_usd,
-                                    to_address=address,
-                                    block_number=transfer['block_number']
+                            # ── Batch into ≤1000-block chunks to avoid RPC range limits ──
+                            chunk_start = from_block
+                            BATCH_SIZE = 1000
+                            while chunk_start <= current_block:
+                                chunk_end = min(chunk_start + BATCH_SIZE - 1, current_block)
+                                transfers = await service.get_erc20_deposits(
+                                    address,
+                                    token_info['address'],
+                                    token_info['decimals'],
+                                    chunk_start,
+                                    chunk_end
                                 )
+                                for transfer in transfers:
+                                    tx_hash = transfer['tx_hash']
+                                    token_amount = transfer['amount']
 
-                                if deposit_id:
-                                    logging.info(f"New token deposit: {token_amount} {token_name} on {chain} for user {telegram_id} (tx: {tx_hash})")
-                                    required_confs = CONFIRMATIONS.get(chain, 10)
-                                    self.db.update_deposit_status(tx_hash, 'confirmed', confirmations=required_confs)
+                                    if token_amount < 1:
+                                        continue
 
-                                    if telegram_id in user_wallets:
-                                        credit_wallet_crypto(telegram_id, token_amount, token_name)
-                                        if telegram_id in user_stats:
-                                            user_stats[telegram_id]["unwagered_deposit"] = (
-                                                user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
-                                            )
-                                        
-                                        # NEW: Referral deposit commission (0.5%)
-                                        if telegram_id in user_stats:
-                                            referrer_id = user_stats[telegram_id]['referral'].get('referrer_id')
-                                            if referrer_id and referrer_id in user_stats:
-                                                commission = token_amount * 0.005  # 0.5% in native crypto
-                                                if 'commissions' not in user_stats[referrer_id]['referral']:
-                                                    user_stats[referrer_id]['referral']['commissions'] = {}
-                                                user_stats[referrer_id]['referral']['commissions'][token_name] = (
-                                                    user_stats[referrer_id]['referral']['commissions'].get(token_name, 0.0) + commission
+                                    if await self.db.async_deposit_exists(tx_hash):
+                                        continue
+
+                                    amount_usd = token_amount  # stablecoin 1:1 with USD
+                                    deposit_id = await self.db.async_add_deposit(
+                                        tx_hash=tx_hash,
+                                        user_id=user_id,
+                                        chain=chain,
+                                        token=token_name,
+                                        amount=token_amount,
+                                        amount_usd=amount_usd,
+                                        to_address=address,
+                                        block_number=transfer['block_number']
+                                    )
+
+                                    if deposit_id:
+                                        found_deposit = True
+                                        logging.info(f"New token deposit: {token_amount} {token_name} on {chain} for user {telegram_id} (tx: {tx_hash})")
+                                        required_confs = CONFIRMATIONS.get(chain, 10)
+                                        await self.db.async_update_deposit_status(tx_hash, 'confirmed', confirmations=required_confs)
+
+                                        if telegram_id in user_wallets:
+                                            credit_wallet_crypto(telegram_id, token_amount, token_name)
+                                            if telegram_id in user_stats:
+                                                user_stats[telegram_id]["unwagered_deposit"] = (
+                                                    user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
                                                 )
-                                                save_user_data(referrer_id)
-                                                logging.info(f"Credited {commission} {token_name} deposit commission to referrer {referrer_id}")
+                                            
+                                            # Referral deposit commission (0.5%)
+                                            if telegram_id in user_stats:
+                                                ref_data = user_stats[telegram_id].get('referral', {})
+                                                referrer_id = ref_data.get('referrer_id')
+                                                if referrer_id and referrer_id in user_stats:
+                                                    commission = token_amount * 0.005
+                                                    ref_dict = user_stats[referrer_id].setdefault('referral', {})
+                                                    comm_dict = ref_dict.setdefault('commissions', {})
+                                                    comm_dict[token_name] = comm_dict.get(token_name, 0.0) + commission
+                                                    save_user_data(referrer_id)
+                                                    logging.info(f"Credited {commission} {token_name} deposit commission to referrer {referrer_id}")
+                                            
+                                            save_user_data(telegram_id)
+                                            logging.info(f"Credited {token_amount} {token_name} to user {telegram_id}")
                                         
-                                        save_user_data(telegram_id)
-                                        logging.info(f"Credited {token_amount} {token_name} to user {telegram_id}")
+                                        if bot:
+                                            try:
+                                                await bot.send_message(
+                                                    chat_id=telegram_id,
+                                                    text=(
+                                                        f"🎉 <b>Deposit Received!</b>\n\n"
+                                                        f"✅ <b>{token_amount:.2f} {token_name}</b> (${amount_usd:.2f}) "
+                                                        f"detected on {chain} and credited to your balance!"
+                                                    ),
+                                                    parse_mode=ParseMode.HTML
+                                                )
+                                            except Exception as notify_err:
+                                                logging.warning(f"Could not notify user {telegram_id}: {notify_err}")
+
+                                chunk_start = chunk_end + 1
+                            self.last_scanned_blocks[track_key] = current_block
 
                     else:
                         # Non-EVM chains (TRON, SOLANA) or fallback: use balance delta
@@ -2987,23 +3550,16 @@ class BlockMonitor:
                                 token_info['decimals']
                             )
 
-                        # Sum of token deposits already recorded but not yet swept
-                        conn = self.db.get_connection()
-                        cursor = conn.cursor()
-                        cursor.execute('''
-                            SELECT COALESCE(SUM(amount), 0) FROM deposits
-                            WHERE user_id = ? AND chain = ? AND to_address = ? AND token = ?
-                            AND status IN ('pending', 'confirmed')
-                        ''', (user_id, chain, address, token_name))
-                        recorded_token_unswept = float(cursor.fetchone()[0])
-                        conn.close()
+                        recorded_token_unswept = await self.db.async_get_recorded_unswept(
+                            user_id, chain, address, token=token_name
+                        )
 
                         new_token_amount = token_balance - recorded_token_unswept
                         if new_token_amount > 1:  # Minimum 1 token
                             tx_hash = f"token_{chain}_{token_name}_{address}_{int(datetime.now().timestamp())}"
-                            amount_usd = new_token_amount  # Assumes stablecoin (USDT/USDC) 1:1 with USD
+                            amount_usd = new_token_amount  # stablecoin 1:1 with USD
 
-                            deposit_id = self.db.add_deposit(
+                            deposit_id = await self.db.async_add_deposit(
                                 tx_hash=tx_hash,
                                 user_id=user_id,
                                 chain=chain,
@@ -3014,9 +3570,10 @@ class BlockMonitor:
                             )
 
                             if deposit_id:
+                                found_deposit = True
                                 logging.info(f"New token deposit: {new_token_amount} {token_name} on {chain} for user {telegram_id}")
                                 required_confs = CONFIRMATIONS.get(chain, 10)
-                                self.db.update_deposit_status(tx_hash, 'confirmed', confirmations=required_confs)
+                                await self.db.async_update_deposit_status(tx_hash, 'confirmed', confirmations=required_confs)
 
                                 if telegram_id in user_wallets:
                                     credit_wallet_crypto(telegram_id, new_token_amount, token_name)
@@ -3025,24 +3582,39 @@ class BlockMonitor:
                                             user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
                                         )
                                     
-                                    # NEW: Referral deposit commission (0.5%)
+                                    # Referral deposit commission (0.5%)
                                     if telegram_id in user_stats:
-                                        referrer_id = user_stats[telegram_id]['referral'].get('referrer_id')
+                                        ref_data = user_stats[telegram_id].get('referral', {})
+                                        referrer_id = ref_data.get('referrer_id')
                                         if referrer_id and referrer_id in user_stats:
-                                            commission = new_token_amount * 0.005  # 0.5% in native crypto
-                                            if 'commissions' not in user_stats[referrer_id]['referral']:
-                                                user_stats[referrer_id]['referral']['commissions'] = {}
-                                            user_stats[referrer_id]['referral']['commissions'][token_name] = (
-                                                user_stats[referrer_id]['referral']['commissions'].get(token_name, 0.0) + commission
-                                            )
+                                            commission = new_token_amount * 0.005
+                                            ref_dict = user_stats[referrer_id].setdefault('referral', {})
+                                            comm_dict = ref_dict.setdefault('commissions', {})
+                                            comm_dict[token_name] = comm_dict.get(token_name, 0.0) + commission
                                             save_user_data(referrer_id)
                                             logging.info(f"Credited {commission} {token_name} deposit commission to referrer {referrer_id}")
                                     
                                     save_user_data(telegram_id)
                                     logging.info(f"Credited {new_token_amount} {token_name} to user {telegram_id}")
+                                
+                                if bot:
+                                    try:
+                                        await bot.send_message(
+                                            chat_id=telegram_id,
+                                            text=(
+                                                f"🎉 <b>Deposit Received!</b>\n\n"
+                                                f"✅ <b>{new_token_amount:.2f} {token_name}</b> (${amount_usd:.2f}) "
+                                                f"detected on {chain} and credited to your balance!"
+                                            ),
+                                            parse_mode=ParseMode.HTML
+                                        )
+                                    except Exception as notify_err:
+                                        logging.warning(f"Could not notify user {telegram_id}: {notify_err}")
 
         except Exception as e:
             logging.error(f"Error scanning {chain} address {address}: {e}")
+        
+        return found_deposit
 
 
 class AutoSweeper:
@@ -3076,31 +3648,26 @@ class AutoSweeper:
             pass
     
     async def process_pending_sweeps(self):
-        """Process all confirmed deposits that need sweeping"""
+        """Process all confirmed deposits that need sweeping (fully async via aiosqlite)."""
         try:
-            # Get deposits ready for sweep
-            conn = self.db.get_connection()
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT d.id, d.tx_hash, d.chain, d.token, d.amount, d.to_address, u.address_index
-                FROM deposits d
-                JOIN user_addresses u ON d.user_id = u.user_id
-                WHERE d.status = 'confirmed' OR (d.status = 'pending' AND d.amount_usd >= ?)
-                ORDER BY d.created_at ASC
-                LIMIT 50
-            ''', (MIN_DEPOSIT_USD,))
-            
-            deposits = cursor.fetchall()
-            conn.close()
-            
+            async with aiosqlite.connect(self.db.db_path) as db:
+                cursor = await db.execute('''
+                    SELECT d.id, d.tx_hash, d.chain, d.token, d.amount, d.to_address, u.address_index
+                    FROM deposits d
+                    JOIN user_addresses u ON d.user_id = u.user_id
+                    WHERE d.status = 'confirmed' OR (d.status = 'pending' AND d.amount_usd >= ?)
+                    ORDER BY d.created_at ASC
+                    LIMIT 50
+                ''', (MIN_DEPOSIT_USD,))
+                deposits = await cursor.fetchall()
+
             for deposit in deposits:
                 dep_id, tx_hash, chain, token, amount, to_address, addr_index = deposit
-                
                 try:
                     await self._sweep_deposit(chain, token, to_address, addr_index, tx_hash)
                 except Exception as e:
                     logging.error(f"Error sweeping deposit {tx_hash}: {e}")
-            
+
         except Exception as e:
             logging.error(f"Error in process_pending_sweeps: {e}")
     
@@ -3131,6 +3698,9 @@ class AutoSweeper:
                     gas_tx = await service.fund_gas(from_address, gas_needed)
                     
                     if gas_tx:
+                        # Atomically raise baseline by gas_needed so BlockMonitor
+                        # doesn't credit the incoming gas as a user deposit.
+                        await self.db.async_increment_last_native_balance(from_address, chain, gas_needed)
                         # Wait for the gas transaction to be mined before sweeping tokens
                         if hasattr(service, 'wait_for_receipt'):
                             try:
@@ -3162,31 +3732,57 @@ class AutoSweeper:
                 else:
                     decimals = TOKEN_CONTRACTS[chain][token]['decimals']
                     sweep_tx_hash = await service.sweep_token(from_address, private_key, token_contract, decimals)
+                
+                if sweep_tx_hash:
+                    await self.db.async_update_deposit_status_swept(
+                        deposit_tx_hash,
+                        sweep_tx_hash=sweep_tx_hash,
+                        swept_at=datetime.now().isoformat()
+                    )
+                    logging.info(f"Successfully swept token deposit {deposit_tx_hash} - Sweep TX: {sweep_tx_hash}")
+                    # Wait for confirmation then lower baseline if balance dropped
+                    if hasattr(service, 'wait_for_receipt'):
+                        try:
+                            await service.wait_for_receipt(sweep_tx_hash, timeout=120)
+                        except Exception:
+                            pass
+                    else:
+                        await asyncio.sleep(15)
+                    post_sweep_balance = await service.get_balance(from_address)
+                    await self.db.async_lower_last_native_balance_if_less(from_address, chain, post_sweep_balance)
             
             else:
                 # Native token sweep
                 logging.info(f"Sweeping native {chain} from {from_address}")
+                sweep_tx_hash = await service.sweep(from_address, private_key)
                 
-                if chain == 'SOLANA':
-                    sweep_tx_hash = await service.sweep(from_address, private_key)
-                else:
-                    sweep_tx_hash = await service.sweep(from_address, private_key)
-            
-            if sweep_tx_hash:
-                # Update database
-                self.db.update_deposit_status(
-                    deposit_tx_hash,
-                    status='swept',
-                    sweep_tx_hash=sweep_tx_hash,
-                    swept_at=datetime.now().isoformat()
-                )
-                logging.info(f"Successfully swept deposit {deposit_tx_hash} - Sweep TX: {sweep_tx_hash}")
+                if sweep_tx_hash:
+                    await self.db.async_update_deposit_status_swept(
+                        deposit_tx_hash,
+                        sweep_tx_hash=sweep_tx_hash,
+                        swept_at=datetime.now().isoformat()
+                    )
+                    logging.info(f"Successfully swept native deposit {deposit_tx_hash} - Sweep TX: {sweep_tx_hash}")
+                    # Wait for confirmation then atomically lower baseline if post-sweep < current
+                    if hasattr(service, 'wait_for_receipt'):
+                        try:
+                            await service.wait_for_receipt(sweep_tx_hash, timeout=120)
+                        except Exception:
+                            pass
+                    else:
+                        await asyncio.sleep(15)
+                    post_sweep_balance = await service.get_balance(from_address)
+                    await self.db.async_lower_last_native_balance_if_less(from_address, chain, post_sweep_balance)
             
         except Exception as e:
             logging.error(f"Error in _sweep_deposit: {e}")
 
 
 # ===== DEPOSIT COMMAND HANDLERS =====
+
+# Single shared DepositDatabase instance — avoids re-running init_db() on every
+# button click and prevents repeated synchronous SQLite initialization.
+global_deposit_db = DepositDatabase()
 
 def build_deposit_menu():
     """Build deposit menu dynamically based on available chains"""
@@ -3231,6 +3827,12 @@ def build_deposit_menu():
         apply_button_style(InlineKeyboardButton("📊 Deposit History", callback_data="deposit_history"), 'primary'),  # BLUE
         apply_button_style(InlineKeyboardButton("🔙 Back", callback_data="back_to_main"), 'danger')  # RED
     ])
+    
+    # Add OxaPay option if configured
+    if OXAPAY_MERCHANT_KEY:
+        keyboard_rows.append([
+            apply_button_style(InlineKeyboardButton("⚡ Deposit via OxaPay", callback_data="deposit_oxapay"), 'primary')
+        ])
     
     text = (
         "💰 <b>Deposit Funds</b>\n\n"
@@ -3279,8 +3881,8 @@ async def deposit_method_callback(update: Update, context: ContextTypes.DEFAULT_
     chain = query.data.replace("deposit_", "")
     
     # Get or create user addresses
-    db = DepositDatabase()
-    user_data = db.get_or_create_user(user_id)
+    db = global_deposit_db
+    user_data = await db.async_get_or_create_user(user_id)
     
     # Get address for selected chain
     address = user_data.get(f"{chain.lower()}_address")
@@ -3337,7 +3939,10 @@ async def deposit_method_callback(update: Update, context: ContextTypes.DEFAULT_
         f"• Only send {info['tokens']} to this address\n"
         f"• Deposits are automatically credited after {CONFIRMATIONS.get(chain, 10)} confirmations\n"
         f"• This is your personal deposit address\n\n"
-        f"<i>Scan QR code or copy address above</i>"
+        f"<i>Scan QR code or copy address above</i>\n\n"
+        f"⚠️ <b>IMPORTANT:</b> After you have sent your funds, you MUST tap the "
+        f"<b>🔄 Check Status</b> button below. The bot will then actively scan the "
+        f"blockchain for your deposit for the next 3 minutes."
     )
     
     keyboard = [
@@ -3382,26 +3987,24 @@ async def check_deposit_status(update: Update, context: ContextTypes.DEFAULT_TYP
                 await query.answer("This button is not for you!", show_alert=True)
                 return
     
-    db = DepositDatabase()
+    db = global_deposit_db
     
-    # If checking a specific chain, trigger a scan for that address
+    # If checking a specific chain, register the user for 3-minute on-demand scanning
     if chain_to_check:
         try:
-            user_data = db.get_or_create_user(user_id)
+            user_data = await db.async_get_or_create_user(user_id)
             address = user_data.get(f"{chain_to_check.lower()}_address")
             
             if address:
-                # Trigger an immediate scan for this specific address
-                monitor = BlockMonitor(db)
-                await monitor.scan_address(chain_to_check, address, user_data['user_id'], user_id)
-                
-                await query.answer("✅ Scan complete! Check results below.", show_alert=True)
+                # Register for on-demand scanning (expires in 3 minutes)
+                expiry = datetime.now() + timedelta(minutes=3)
+                active_manual_scans[(user_id, chain_to_check)] = expiry
+                logging.info(f"Registered on-demand scan for user {user_id} on {chain_to_check} (expires {expiry})")
         except Exception as e:
-            logging.error(f"Error scanning address: {e}")
-            await query.answer("⚠️ Error scanning address", show_alert=True)
+            logging.error(f"Error registering scan: {e}")
     
-    # Get deposit history
-    deposits = db.get_user_deposits(user_id, limit=5)
+    # Get deposit history (async to avoid blocking the event loop)
+    deposits = await global_deposit_db.async_get_user_deposits(user_id, limit=5)
     
     # Chain name mapping for display
     chain_names = {
@@ -3413,21 +4016,13 @@ async def check_deposit_status(update: Update, context: ContextTypes.DEFAULT_TYP
         'TON': 'TON'
     }
     
-    if not deposits:
-        text = (
-            "📊 <b>Deposit Status</b>\n\n"
-            "✅ <b>Scan Complete!</b>\n\n"
-            "No deposits detected yet.\n\n"
-            f"<i>Deposits for {chain_names.get(chain_to_check, chain_to_check) if chain_to_check else 'all chains'} have been checked.\n"
-            "Send funds to your deposit address and check again.</i>"
-        )
-        keyboard = [
-            [InlineKeyboardButton("🔄 Scan Again", callback_data=f"check_deposit_{chain_to_check}_{user_id}" if chain_to_check else "deposit_history")],
-            [InlineKeyboardButton("🔙 Back", callback_data=f"back_to_deposit_menu_{user_id}")]
-        ]
-    else:
-        text = "📊 <b>Recent Deposits</b>\n\n"
-        
+    text = (
+        "📊 <b>Deposit Status</b>\n\n"
+        "✅ <b>Started scanning the blockchain for the next 3 minutes.</b>\n"
+        "You will be notified automatically when your deposit arrives!\n\n"
+    )
+    if deposits:
+        text += "📋 <b>Recent Deposits:</b>\n\n"
         for dep in deposits:
             tx_hash, chain, token, amount, amount_usd, status, created_at, confirmed_at = dep
             
@@ -3446,11 +4041,17 @@ async def check_deposit_status(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"   Date: {created_at[:19]}\n"
                 f"   TX: <code>{tx_hash[:16]}...</code>\n\n"
             )
-        
-        keyboard = [
-            [InlineKeyboardButton("🔄 Scan Again", callback_data=f"check_deposit_{chain_to_check}_{user_id}" if chain_to_check else "deposit_history")],
-            [InlineKeyboardButton("🔙 Back", callback_data=f"back_to_deposit_menu_{user_id}")]
-        ]
+    else:
+        text += (
+            f"<i>No deposits recorded yet for "
+            f"{chain_names.get(chain_to_check, chain_to_check) if chain_to_check else 'all chains'}.\n"
+            "Send funds to your deposit address — you'll be notified when it arrives.</i>"
+        )
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Scan Again", callback_data=f"check_deposit_{chain_to_check}_{user_id}" if chain_to_check else "deposit_history")],
+        [InlineKeyboardButton("🔙 Back", callback_data=f"back_to_deposit_menu_{user_id}")]
+    ]
     
     # Use safe_edit_message to handle the transition from Photo -> Text
     await safe_edit_message(
@@ -3488,25 +4089,197 @@ async def back_to_deposit_menu(update: Update, context: ContextTypes.DEFAULT_TYP
     await safe_edit_message(query, text, reply_markup=create_styled_keyboard(keyboard), parse_mode=ParseMode.HTML)
 
 
+# ===== OXAPAY DEPOSIT FLOW =====
+
+# ConversationHandler states for OxaPay
+OXAPAY_ASK_AMOUNT = "oxapay_ask_amount"
+OXAPAY_ASK_CURRENCY = "oxapay_ask_currency"
+
+
+async def oxapay_deposit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point: user clicks '⚡ Deposit via OxaPay'."""
+    query = update.callback_query
+    if not check_menu_ownership(query, context):
+        await query.answer("This menu is not for you.", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+    await safe_edit_message(
+        query,
+        "⚡ <b>OxaPay Deposit</b>\n\n"
+        "How much USD would you like to deposit? (e.g. <code>20</code>)\n\n"
+        "<i>Type /cancel to abort.</i>",
+        parse_mode=ParseMode.HTML
+    )
+    return OXAPAY_ASK_AMOUNT
+
+
+async def oxapay_receive_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User sends USD amount."""
+    text = update.message.text.strip()
+    try:
+        amount = float(text)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount. Please enter a positive number, e.g. <code>20</code>.", parse_mode=ParseMode.HTML)
+        return OXAPAY_ASK_AMOUNT
+    context.user_data['oxapay_amount'] = amount
+    await update.message.reply_text(
+        "Which crypto would you like to pay with?\n\n"
+        "Supported: <code>BTC</code>, <code>ETH</code>, <code>USDT</code>, <code>LTC</code>, <code>TRX</code>\n\n"
+        "Type the currency symbol (e.g. <code>USDT</code>).\n<i>Type /cancel to abort.</i>",
+        parse_mode=ParseMode.HTML
+    )
+    return OXAPAY_ASK_CURRENCY
+
+
+async def oxapay_receive_currency(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User sends currency, create OxaPay invoice and send link."""
+    currency = update.message.text.strip().upper()
+    if currency not in OXAPAY_SUPPORTED_CURRENCIES:
+        await update.message.reply_text(
+            f"❌ Unsupported currency. Choose from: {', '.join(sorted(OXAPAY_SUPPORTED_CURRENCIES))}",
+            parse_mode=ParseMode.HTML
+        )
+        return OXAPAY_ASK_CURRENCY
+
+    amount_usd = context.user_data.get('oxapay_amount', 0)
+    user_id = update.effective_user.id
+    svc = OxaPayService(OXAPAY_MERCHANT_KEY, OXAPAY_WEBHOOK_HOST)
+    pay_url = await svc.create_invoice(user_id, amount_usd, currency)
+
+    if pay_url:
+        await update.message.reply_text(
+            f"✅ <b>OxaPay Invoice Created!</b>\n\n"
+            f"Amount: <b>${amount_usd:.2f}</b> in <b>{currency}</b>\n\n"
+            f"👉 <a href=\"{pay_url}\">Click here to complete payment</a>\n\n"
+            f"<i>Your balance will be credited automatically after payment confirmation.</i>",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Failed to create OxaPay invoice. Please try again later or contact support."
+        )
+    return ConversationHandler.END
+
+
+async def oxapay_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel OxaPay flow."""
+    if update.message:
+        await update.message.reply_text("❌ OxaPay deposit cancelled.")
+    return ConversationHandler.END
+
+
+async def oxapay_webhook_handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    """aiohttp endpoint to receive OxaPay payment callbacks."""
+    try:
+        data = await request.json()
+        logging.info(f"OxaPay webhook received: {data}")
+
+        status = data.get("status", "").lower()
+        # OxaPay uses "paid" as the terminal success status for completed payments.
+        # Other statuses (e.g. "waiting", "expired", "refunded") do not represent
+        # confirmed funds and must not trigger a credit. Return "ok" immediately so
+        # OxaPay does not enter a retry loop for these events.
+        if status != "paid":
+            return aiohttp.web.Response(text="ok")
+
+        order_id = data.get("orderId", "")
+        amount_usd = float(data.get("amount", 0))
+        # Use the actual currency paid (fallback to USDT for stablecoins)
+        paid_currency = data.get("currency", "USDT").upper()
+        # payAmount is the actual crypto units received (e.g. 0.001 BTC, 0.5 ETH).
+        # Fallback to USD amount for stablecoins where payAmount may equal amount.
+        raw_pay = data.get("payAmount") if data.get("payAmount") is not None else data.get("pay_amount")
+        pay_amount = float(raw_pay) if raw_pay is not None else amount_usd
+
+        # Validate: do not credit zero or negative amounts.
+        # Return "ok" so OxaPay does not retry -- a zero payAmount on a
+        # "paid" callback is a data anomaly, not a transient error.
+        if pay_amount <= 0:
+            logging.warning(f"OxaPay webhook: pay_amount is {pay_amount} for orderId {order_id}, skipping credit")
+            return aiohttp.web.Response(text="ok")
+
+        # orderId format: {telegram_id}_{timestamp}
+        telegram_id_str = order_id.split("_")[0] if "_" in order_id else ""
+        if not telegram_id_str.isdigit():
+            logging.warning(f"OxaPay webhook: unrecognised orderId {order_id}")
+            return aiohttp.web.Response(text="ok")
+
+        telegram_id = int(telegram_id_str)
+
+        if telegram_id in user_wallets:
+            # Credit the actual crypto amount (BTC→BTC, SOL→SOL, ETH→ETH, USDT→USDT, etc.)
+            credit_wallet_crypto(telegram_id, pay_amount, paid_currency)
+            if telegram_id in user_stats:
+                user_stats[telegram_id]["unwagered_deposit"] = (
+                    user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
+                )
+            save_user_data(telegram_id)
+            logging.info(f"OxaPay: credited {pay_amount} {paid_currency} (${amount_usd:.2f}) to user {telegram_id}")
+        else:
+            logging.warning(f"OxaPay webhook: user {telegram_id} not found in user_wallets")
+
+        return aiohttp.web.Response(text="ok")
+    except Exception as e:
+        logging.error(f"OxaPay webhook error: {e}")
+        return aiohttp.web.Response(text="error", status=500)
+
+
+async def start_oxapay_webhook_server():
+    """Start aiohttp web server for OxaPay webhooks."""
+    if not OXAPAY_MERCHANT_KEY or not OXAPAY_WEBHOOK_HOST:
+        logging.info("OxaPay webhook server not started (OXAPAY_MERCHANT_KEY or OXAPAY_WEBHOOK_HOST not set).")
+        return
+    app_web = aiohttp.web.Application()
+    app_web.router.add_post("/oxapay_webhook", oxapay_webhook_handler)
+    runner = aiohttp.web.AppRunner(app_web)
+    await runner.setup()
+    site = aiohttp.web.TCPSite(runner, "0.0.0.0", OXAPAY_WEBHOOK_PORT)
+    await site.start()
+    logging.info(f"OxaPay webhook server listening on port {OXAPAY_WEBHOOK_PORT}")
+
+
 # ===== BACKGROUND TASKS =====
 
-async def monitor_deposits_task(application):
-    """Background task to monitor deposits"""
-    db = DepositDatabase()
+async def active_scans_monitor_task(application):
+    """Background task: every 15 s scan addresses registered via 'Check Status' button.
+    When a deposit is found, notify the user via DM and remove them from the scan list."""
+    db = global_deposit_db
     monitor = BlockMonitor(db)
-    
+
     while not bot_stopped:
         try:
-            await monitor.scan_all_addresses()
-            await asyncio.sleep(SCAN_INTERVAL)
+            now = datetime.now()
+            expired_keys = [k for k, exp in list(active_manual_scans.items()) if now >= exp]
+            for key in expired_keys:
+                active_manual_scans.pop(key, None)
+
+            for (telegram_id, chain), expiry in list(active_manual_scans.items()):
+                try:
+                    user_data = await db.async_get_or_create_user(telegram_id)
+                    address = user_data.get(f"{chain.lower()}_address")
+                    if not address:
+                        continue
+                    found = await monitor.scan_address(
+                        chain, address, user_data['user_id'], telegram_id,
+                        bot=application.bot
+                    )
+                    if found:
+                        active_manual_scans.pop((telegram_id, chain), None)
+                except Exception as scan_err:
+                    logging.error(f"active_scans_monitor_task scan error for {telegram_id}/{chain}: {scan_err}")
+
+            await asyncio.sleep(15)
         except Exception as e:
-            logging.error(f"Error in deposit monitor: {e}")
-            await asyncio.sleep(SCAN_INTERVAL)
+            logging.error(f"Error in active_scans_monitor_task: {e}")
+            await asyncio.sleep(15)
 
 
 async def sweep_deposits_task(application):
     """Background task to sweep deposits"""
-    db = DepositDatabase()
+    db = global_deposit_db
     sweeper = AutoSweeper(db)
     
     while not bot_stopped:
@@ -4298,6 +5071,40 @@ def save_all_user_data():
     for user_id in user_stats.keys():
         save_user_data(user_id)
     logging.info("All user data saved.")
+
+def load_user_data_if_missing(user_id: int):
+    """Load a user's data from disk into memory if not already present.
+
+    Prevents silent deposit loss after bot restarts where users are not yet
+    in the in-memory ``user_stats``/``user_wallets`` dicts.
+    """
+    if user_id in user_stats:
+        return  # Already loaded — nothing to do
+    fpath = os.path.join(DATA_DIR, f"{user_id}.json")
+    if not os.path.exists(fpath):
+        return  # No file yet — new user
+    try:
+        with open(fpath, "r") as f:
+            data = json.load(f)
+        raw_wallet = data.get("wallet", 0.0)
+        if isinstance(raw_wallet, (int, float)):
+            user_wallets[user_id] = {"USDT": float(raw_wallet)}
+        elif isinstance(raw_wallet, dict):
+            clean_wallet = {}
+            for k, v in raw_wallet.items():
+                try:
+                    clean_wallet[k] = float(v)
+                except (TypeError, ValueError):
+                    logging.warning(f"load_user_data_if_missing: invalid wallet value for user {user_id}, coin {k}: {v}")
+            user_wallets[user_id] = clean_wallet if clean_wallet else {"USDT": 0.0}
+        else:
+            user_wallets[user_id] = {"USDT": 0.0}
+        if "active_currency" not in data:
+            data["active_currency"] = "USDT"
+        user_stats[user_id] = data
+        logging.info(f"load_user_data_if_missing: loaded user {user_id} from disk")
+    except Exception as e:
+        logging.error(f"load_user_data_if_missing: failed to load user {user_id}: {e}")
 
 ## NEW FEATURE - Data Persistence ##
 def save_bot_state():
@@ -12765,7 +13572,7 @@ async def rain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Create rain in DB
     rain_id = str(uuid.uuid4())
     end_time = (datetime.now(timezone.utc) + timedelta(seconds=RAIN_DURATION_SECONDS)).isoformat()
-    db = DepositDatabase()
+    db = global_deposit_db
     db.create_rain(
         rain_id=rain_id,
         chat_id=update.effective_chat.id,
@@ -12806,7 +13613,7 @@ async def join_rain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user = query.from_user
     rain_id = query.data.replace("join_rain_", "", 1)
 
-    db = DepositDatabase()
+    db = global_deposit_db
     rain = db.get_rain(rain_id)
 
     if not rain:
@@ -12863,7 +13670,7 @@ async def finalize_rain_job(context: ContextTypes.DEFAULT_TYPE):
     chat_id = data['chat_id']
     message_id = data['message_id']
 
-    db = DepositDatabase()
+    db = global_deposit_db
     rain = db.get_rain(rain_id)
 
     if not rain or rain['status'] != 'active':
@@ -13948,7 +14755,38 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
         return
 
-    await update.message.reply_text("No game or escrow deal found with that ID.")
+    # Check in active raffles
+    if unique_id in active_raffles:
+        raffle = active_raffles[unique_id]
+        user = update.effective_user
+        end_time = datetime.fromisoformat(raffle['end_time'].replace('Z', '+00:00'))
+        time_left = end_time - datetime.now(timezone.utc)
+        total_tickets = sum(raffle['tickets'].values())
+        participants = len(raffle['tickets'])
+        user_tickets = raffle['tickets'].get(user.id, 0)
+        user_wager = raffle['wager_tracker'].get(user.id, 0.0)
+        time_str = (f"{time_left.days}d {time_left.seconds // 3600}h {(time_left.seconds // 60) % 60}m"
+                    if time_left.total_seconds() > 0 else "Ended")
+        msg += (
+            f"<b>Type:</b> Raffle\n"
+            f"💰 <b>Prize Pool:</b> ${raffle['prize_usd']:.2f}\n"
+            f"🎫 <b>Ticket Cost:</b> ${raffle['ticket_cost']:.2f} wagered\n"
+            f"👥 <b>Type:</b> {raffle['type'].title()}\n"
+            f"🏆 <b>Winners:</b> {raffle['total_winners']}\n"
+            f"⏰ <b>Time Left:</b> {time_str}\n\n"
+            f"📊 <b>Statistics:</b>\n"
+            f"🎫 Total Tickets: {total_tickets}\n"
+            f"👥 Participants: {participants}\n\n"
+            f"<b>Your Progress:</b>\n"
+            f"🎫 Your Tickets: {user_tickets}\n"
+            f"💵 Your Wagered: ${user_wager:.2f}\n"
+        )
+        if raffle.get('type') == 'referrals':
+            msg += "\n💡 Only referrals of the creator can participate"
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+        return
+
+    await update.message.reply_text("❌ No game, escrow deal, or raffle found with that ID.", parse_mode=ParseMode.HTML)
 
 # --- MESSAGE LISTENER HANDLER ---
 @check_banned
@@ -16624,52 +17462,6 @@ async def raffles_back_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 @check_banned
 @check_maintenance
-async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show detailed raffle info"""
-    user = update.effective_user
-    await ensure_user_in_wallets(user.id, user.username, context=context)
-    
-    if not context.args or len(context.args) != 1:
-        await update.message.reply_text("Usage: <code>/info RAFFLE_ID</code>", parse_mode=ParseMode.HTML)
-        return
-    
-    raffle_id = context.args[0]
-    
-    if raffle_id not in active_raffles:
-        await update.message.reply_text("❌ Raffle not found or has ended.")
-        return
-    
-    raffle = active_raffles[raffle_id]
-    end_time = datetime.fromisoformat(raffle['end_time'].replace('Z', '+00:00'))
-    time_left = end_time - datetime.now(timezone.utc)
-    total_tickets = sum(raffle['tickets'].values())
-    participants = len(raffle['tickets'])
-    
-    # User's tickets
-    user_tickets = raffle['tickets'].get(user.id, 0)
-    user_wager = raffle['wager_tracker'].get(user.id, 0.0)
-    
-    msg = (
-        f"🎰 <b>Raffle Details</b>\n\n"
-        f"<b>ID:</b> <code>{raffle_id}</code>\n"
-        f"💰 <b>Prize Pool:</b> ${raffle['prize_usd']:.2f}\n"
-        f"🎫 <b>Ticket Cost:</b> ${raffle['ticket_cost']:.2f} wagered\n"
-        f"👥 <b>Type:</b> {raffle['type'].title()}\n"
-        f"🏆 <b>Winners:</b> {raffle['total_winners']}\n"
-        f"⏰ <b>Time Left:</b> {time_left.days}d {time_left.seconds//3600}h {(time_left.seconds//60)%60}m\n\n"
-        f"📊 <b>Statistics:</b>\n"
-        f"🎫 Total Tickets: {total_tickets}\n"
-        f"👥 Participants: {participants}\n\n"
-        f"<b>Your Progress:</b>\n"
-        f"🎫 Your Tickets: {user_tickets}\n"
-        f"💵 Your Wagered: ${user_wager:.2f}\n"
-    )
-    
-    if raffle['type'] == 'referrals':
-        msg += f"\n💡 Only referrals of the creator can participate"
-    
-    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
-
 ## NEW FEATURE - /level and /levelall commands ##
 def create_progress_bar(progress, total, length=10):
     """Creates a text-based progress bar."""
@@ -19035,8 +19827,8 @@ async def post_init(application: Application):
     Post initialization hook to start background tasks.
     This runs after the event loop is started by run_polling().
     """
-    # Start the deposit monitor task
-    application.create_task(monitor_deposits_task(application))
+    # Start the on-demand deposit scanner (replaces global poll)
+    application.create_task(active_scans_monitor_task(application))
     
     # Start the sweep task (if you want it running as well)
     application.create_task(sweep_deposits_task(application))
@@ -19046,6 +19838,9 @@ async def post_init(application: Application):
     
     # Start the raffle monitoring task
     application.create_task(monitor_raffles_task(application))
+
+    # Start OxaPay webhook server (no-op if not configured)
+    application.create_task(start_oxapay_webhook_server())
     
     logging.info("Background tasks started successfully via post_init")
 # --- Main Function ---)
@@ -19584,6 +20379,19 @@ def main():
     app.add_handler(CallbackQueryHandler(deposit_method_callback, pattern=r"^deposit_(ETH|BNB|BASE|TRON|SOLANA|TON)$"))
     app.add_handler(CallbackQueryHandler(check_deposit_status, pattern=r"^(deposit_history|check_deposit_)"))
     app.add_handler(CallbackQueryHandler(back_to_deposit_menu, pattern=r"^back_to_deposit_menu"))
+
+    # OxaPay ConversationHandler
+    oxapay_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(oxapay_deposit_start, pattern=r"^deposit_oxapay$")],
+        states={
+            OXAPAY_ASK_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, oxapay_receive_amount)],
+            OXAPAY_ASK_CURRENCY: [MessageHandler(filters.TEXT & ~filters.COMMAND, oxapay_receive_currency)],
+        },
+        fallbacks=[CommandHandler("cancel", oxapay_cancel)],
+        per_user=True,
+        conversation_timeout=timedelta(minutes=5).total_seconds()
+    )
+    app.add_handler(oxapay_handler)
 
     # ===== RAIN SYSTEM HANDLERS =====
     app.add_handler(CallbackQueryHandler(join_rain_callback, pattern=r"^join_rain_"))
