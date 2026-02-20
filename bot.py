@@ -3418,9 +3418,9 @@ class BlockMonitor:
                             referrer_id = ref_data.get('referrer_id')
                             if referrer_id and referrer_id in user_stats:
                                 commission = new_native_amount * 0.005
-                                user_stats[referrer_id].setdefault('referral', {}).setdefault('commissions', {})[symbol] = (
-                                    user_stats[referrer_id]['referral']['commissions'].get(symbol, 0.0) + commission
-                                )
+                                ref_dict = user_stats[referrer_id].setdefault('referral', {})
+                                comm_dict = ref_dict.setdefault('commissions', {})
+                                comm_dict[symbol] = comm_dict.get(symbol, 0.0) + commission
                                 save_user_data(referrer_id)
                                 logging.info(f"Credited {commission} {symbol} deposit commission to referrer {referrer_id}")
                         
@@ -3513,9 +3513,9 @@ class BlockMonitor:
                                                 referrer_id = ref_data.get('referrer_id')
                                                 if referrer_id and referrer_id in user_stats:
                                                     commission = token_amount * 0.005
-                                                    user_stats[referrer_id].setdefault('referral', {}).setdefault('commissions', {})[token_name] = (
-                                                        user_stats[referrer_id]['referral']['commissions'].get(token_name, 0.0) + commission
-                                                    )
+                                                    ref_dict = user_stats[referrer_id].setdefault('referral', {})
+                                                    comm_dict = ref_dict.setdefault('commissions', {})
+                                                    comm_dict[token_name] = comm_dict.get(token_name, 0.0) + commission
                                                     save_user_data(referrer_id)
                                                     logging.info(f"Credited {commission} {token_name} deposit commission to referrer {referrer_id}")
                                             
@@ -3588,9 +3588,9 @@ class BlockMonitor:
                                         referrer_id = ref_data.get('referrer_id')
                                         if referrer_id and referrer_id in user_stats:
                                             commission = new_token_amount * 0.005
-                                            user_stats[referrer_id].setdefault('referral', {}).setdefault('commissions', {})[token_name] = (
-                                                user_stats[referrer_id]['referral']['commissions'].get(token_name, 0.0) + commission
-                                            )
+                                            ref_dict = user_stats[referrer_id].setdefault('referral', {})
+                                            comm_dict = ref_dict.setdefault('commissions', {})
+                                            comm_dict[token_name] = comm_dict.get(token_name, 0.0) + commission
                                             save_user_data(referrer_id)
                                             logging.info(f"Credited {commission} {token_name} deposit commission to referrer {referrer_id}")
                                     
