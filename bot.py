@@ -3373,9 +3373,6 @@ class BlockMonitor:
             if not service:
                 return False
 
-            # Ensure the user's data is in memory (may be missing after a bot restart)
-            load_user_data_if_missing(telegram_id)
-
             # ── Native balance delta (baseline tracking model) ──────────────
             # Compare current on-chain balance against the stored baseline.
             # The baseline is updated every time a new deposit is credited or
@@ -3417,12 +3414,11 @@ class BlockMonitor:
                         
                         # Referral deposit commission (0.5%)
                         if telegram_id in user_stats:
-                            referrer_id = user_stats[telegram_id]['referral'].get('referrer_id')
+                            ref_data = user_stats[telegram_id].get('referral', {})
+                            referrer_id = ref_data.get('referrer_id')
                             if referrer_id and referrer_id in user_stats:
                                 commission = new_native_amount * 0.005
-                                if 'commissions' not in user_stats[referrer_id]['referral']:
-                                    user_stats[referrer_id]['referral']['commissions'] = {}
-                                user_stats[referrer_id]['referral']['commissions'][symbol] = (
+                                user_stats[referrer_id].setdefault('referral', {}).setdefault('commissions', {})[symbol] = (
                                     user_stats[referrer_id]['referral']['commissions'].get(symbol, 0.0) + commission
                                 )
                                 save_user_data(referrer_id)
@@ -3513,12 +3509,11 @@ class BlockMonitor:
                                             
                                             # Referral deposit commission (0.5%)
                                             if telegram_id in user_stats:
-                                                referrer_id = user_stats[telegram_id]['referral'].get('referrer_id')
+                                                ref_data = user_stats[telegram_id].get('referral', {})
+                                                referrer_id = ref_data.get('referrer_id')
                                                 if referrer_id and referrer_id in user_stats:
                                                     commission = token_amount * 0.005
-                                                    if 'commissions' not in user_stats[referrer_id]['referral']:
-                                                        user_stats[referrer_id]['referral']['commissions'] = {}
-                                                    user_stats[referrer_id]['referral']['commissions'][token_name] = (
+                                                    user_stats[referrer_id].setdefault('referral', {}).setdefault('commissions', {})[token_name] = (
                                                         user_stats[referrer_id]['referral']['commissions'].get(token_name, 0.0) + commission
                                                     )
                                                     save_user_data(referrer_id)
@@ -3589,12 +3584,11 @@ class BlockMonitor:
                                     
                                     # Referral deposit commission (0.5%)
                                     if telegram_id in user_stats:
-                                        referrer_id = user_stats[telegram_id]['referral'].get('referrer_id')
+                                        ref_data = user_stats[telegram_id].get('referral', {})
+                                        referrer_id = ref_data.get('referrer_id')
                                         if referrer_id and referrer_id in user_stats:
                                             commission = new_token_amount * 0.005
-                                            if 'commissions' not in user_stats[referrer_id]['referral']:
-                                                user_stats[referrer_id]['referral']['commissions'] = {}
-                                            user_stats[referrer_id]['referral']['commissions'][token_name] = (
+                                            user_stats[referrer_id].setdefault('referral', {}).setdefault('commissions', {})[token_name] = (
                                                 user_stats[referrer_id]['referral']['commissions'].get(token_name, 0.0) + commission
                                             )
                                             save_user_data(referrer_id)
@@ -4214,9 +4208,6 @@ async def oxapay_webhook_handler(request: aiohttp.web.Request) -> aiohttp.web.Re
             return aiohttp.web.Response(text="ok")
 
         telegram_id = int(telegram_id_str)
-
-        # Ensure user data is in memory (may be absent after bot restart)
-        load_user_data_if_missing(telegram_id)
 
         if telegram_id in user_wallets:
             # Credit the actual crypto amount (BTC→BTC, SOL→SOL, ETH→ETH, USDT→USDT, etc.)
